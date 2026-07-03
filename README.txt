@@ -8,3 +8,7 @@ Motivation
 
 Compatibility
   - Support same command line options as aws-sigv4-proxy.
+  - Known difference: kingpin-specific flag syntax is not supported —
+    attached short values (-sAuthorization), clustered shorts (-vs) and
+    negation (--no-verbose). Use --strip Authorization / -s Authorization
+    and --flag=value instead.

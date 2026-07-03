@@ -1,12 +1,18 @@
 package main
 
 import (
+	"errors"
+	"flag"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
+	"testing/iotest"
+	"time"
+	"unicode/utf8"
 
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -38,8 +44,44 @@ func TestDetermineAWSServiceFromHost(t *testing.T) {
 		{host: "mybucket.s3.us-west-2.amazonaws.com", wantName: "s3", wantRegion: "us-west-2"},
 		{host: "mybucket.s3.dualstack.eu-west-1.amazonaws.com", wantName: "s3", wantRegion: "eu-west-1"},
 		{host: "s3-ap-northeast-1.amazonaws.com", wantName: "s3", wantRegion: "ap-northeast-1"},
+		{host: "mybucket.s3-us-west-2.amazonaws.com", wantName: "s3", wantRegion: "us-west-2"},
+		{host: "s3.amazonaws.com", wantName: "s3", wantRegion: "us-east-1"},
+		// A dotted, region-shaped bucket name on the legacy global endpoint
+		// must not steal the signing region.
+		{host: "us-west-2.backups.s3.amazonaws.com", wantName: "s3", wantRegion: "us-east-1"},
+		{host: "s3.s3.us-west-2.amazonaws.com", wantName: "s3", wantRegion: "us-west-2"},
+		// S3 interface VPC endpoint: the region sits after the s3 label but
+		// is not the final label.
+		{host: "bucket.vpce-0a1b2c3d4e5f.s3.us-west-2.vpce.amazonaws.com", wantName: "s3", wantRegion: "us-west-2"},
+		// An s3 label with a region-less suffix is not a known S3 form and
+		// must fail loudly rather than sign as global S3.
+		{host: "bucket.s3.notregion.amazonaws.com", wantNil: true},
+		{host: "123456789012.s3-control.us-west-2.amazonaws.com", wantName: "s3", wantRegion: "us-west-2"},
+		// Services whose signing name differs from the endpoint label.
+		{host: "email.us-east-1.amazonaws.com", wantName: "ses", wantRegion: "us-east-1"},
+		{host: "appstream2.us-west-2.amazonaws.com", wantName: "appstream", wantRegion: "us-west-2"},
+		{host: "transcribestreaming.us-east-2.amazonaws.com", wantName: "transcribe", wantRegion: "us-east-2"},
+		{host: "abc123def.appsync-api.us-east-1.amazonaws.com", wantName: "appsync", wantRegion: "us-east-1"},
+		// IoT: bare control plane signs "iot", data-plane hosts sign "iotdata".
+		{host: "iot.us-east-1.amazonaws.com", wantName: "iot", wantRegion: "us-east-1"},
+		{host: "a1b2c3d4e5-ats.iot.us-east-1.amazonaws.com", wantName: "iotdata", wantRegion: "us-east-1"},
+		{host: "data.iot.us-east-1.amazonaws.com", wantName: "iotdata", wantRegion: "us-east-1"},
+		{host: "data.jobs.iot.us-east-1.amazonaws.com", wantName: "iot-jobs-data", wantRegion: "us-east-1"},
+		// The credentials provider does not use SigV4; unknown iot data
+		// planes must not be guessed.
+		{host: "abc123.credentials.iot.us-east-1.amazonaws.com", wantNil: true},
+		// OpenSearch Serverless data plane, parallel to the es rule.
+		{host: "abc123.us-east-1.aoss.amazonaws.com", wantName: "aoss", wantRegion: "us-east-1"},
+		{host: "search-mydomain-abc123.us-west-2.cloudsearch.amazonaws.com", wantName: "cloudsearch", wantRegion: "us-west-2"},
+		{host: "doc-mydomain-abc123.us-west-2.cloudsearch.amazonaws.com", wantName: "cloudsearch", wantRegion: "us-west-2"},
+		// Region-less endpoints with a non-default signing region or name.
+		{host: "globalaccelerator.amazonaws.com", wantName: "globalaccelerator", wantRegion: "us-west-2"},
+		{host: "queue.amazonaws.com", wantName: "sqs", wantRegion: "us-east-1"},
+		{host: "us-east-2.queue.amazonaws.com", wantName: "sqs", wantRegion: "us-east-2"},
 		{host: "sts.cn-north-1.amazonaws.com.cn", wantName: "sts", wantRegion: "cn-north-1"},
 		{host: "sts.us-east-1.amazonaws.com:443", wantName: "sts", wantRegion: "us-east-1"},
+		// Garbage labels must not become signing names.
+		{host: "my_svc!.us-east-1.amazonaws.com", wantNil: true},
 		{host: ".us-east-1.amazonaws.com", wantNil: true},
 		{host: "a..s3.us-west-2.amazonaws.com", wantNil: true},
 		{host: "example.com", wantNil: true},
@@ -66,6 +108,15 @@ func TestDetermineAWSServiceFromHost(t *testing.T) {
 	}
 }
 
+func isASCII(s string) bool {
+	for i := range len(s) {
+		if s[i] >= utf8.RuneSelf {
+			return false
+		}
+	}
+	return true
+}
+
 // FuzzDetermineAWSServiceFromHost checks that arbitrary (attacker-controlled)
 // Host values never panic the parser, and that any non-nil result satisfies
 // the signing invariants.
@@ -79,11 +130,44 @@ func FuzzDetermineAWSServiceFromHost(f *testing.F) {
 	f.Add("sts.cn-north-1.amazonaws.com.cn")
 	f.Add("search-mydomain-abcdef.us-west-2.es.amazonaws.com")
 	f.Add("s3.amazonaws.com")
+	f.Add("us-west-2.backups.s3.amazonaws.com")
+	f.Add("bucket.vpce-0a1b2c3d4e5f.s3.us-west-2.vpce.amazonaws.com")
+	f.Add("data.jobs.iot.us-east-1.amazonaws.com")
+	f.Add("email.us-east-1.amazonaws.com")
+	f.Add("a1b2c3d4e5-ats.iot.us-east-1.amazonaws.com")
+	f.Add("abc123.us-east-1.aoss.amazonaws.com")
+	f.Add("queue.amazonaws.com")
+	f.Add("my_svc!.us-east-1.amazonaws.com")
 	f.Add("")
 	f.Fuzz(func(t *testing.T, host string) {
 		svc := determineAWSServiceFromHost(host)
+		// isRegion is reused because no matcher validates the region centrally;
+		// a future matcher deriving an unvalidated region is still caught.
 		if svc != nil && (svc.signingName == "" || !isRegion(svc.signingRegion)) {
 			t.Fatalf("invalid service for %q: %+v", host, svc)
+		}
+		// Normalization invariance: a default port, trailing dot or different
+		// case must not change the result. Skip variants that do not normalize
+		// back to the same host (colons/brackets, an existing trailing dot,
+		// non-ASCII case mappings that do not round-trip).
+		var variants []string
+		if isASCII(host) {
+			variants = append(variants, strings.ToUpper(host))
+		}
+		if !strings.ContainsAny(host, ":[]") {
+			variants = append(variants, host+":443")
+		}
+		if !strings.HasSuffix(host, ".") {
+			variants = append(variants, host+".")
+		}
+		for _, v := range variants {
+			got := determineAWSServiceFromHost(v)
+			switch {
+			case (svc == nil) != (got == nil):
+				t.Fatalf("determineAWSServiceFromHost(%q) = %+v, but (%q) = %+v", host, svc, v, got)
+			case svc != nil && *svc != *got:
+				t.Fatalf("determineAWSServiceFromHost(%q) = %+v, but (%q) = %+v", host, *svc, v, *got)
+			}
 		}
 	})
 }
@@ -104,18 +188,6 @@ func TestParseCustomHeaders(t *testing.T) {
 	}
 	if len(parseCustomHeaders("", discardLogger())) != 0 {
 		t.Errorf("empty input should yield no headers")
-	}
-}
-
-func TestChunked(t *testing.T) {
-	if chunked(nil) {
-		t.Error("nil transfer-encoding should not be chunked")
-	}
-	if chunked([]string{"identity"}) {
-		t.Error("identity should not be chunked")
-	}
-	if !chunked([]string{"chunked"}) {
-		t.Error("chunked should be chunked")
 	}
 }
 
@@ -176,7 +248,6 @@ func TestProxyClientSignsRequest(t *testing.T) {
 	p := staticProxy(stub)
 
 	req := httptest.NewRequest(http.MethodGet, "http://sts.us-east-1.amazonaws.com/?Action=GetCallerIdentity", nil)
-	req.Host = "sts.us-east-1.amazonaws.com"
 
 	resp, err := p.Do(req)
 	if err != nil {
@@ -210,7 +281,6 @@ func TestProxyClientOverrides(t *testing.T) {
 	p.customHeaders = http.Header{"X-Custom": []string{"yes"}}
 
 	req := httptest.NewRequest(http.MethodPost, "http://ignored.example.com/path", strings.NewReader("payload"))
-	req.Host = "ignored.example.com"
 	req.Header.Set("Authorization-Downstream", "secret")
 	req.Header.Set("X-Trace", "abc")
 
@@ -244,9 +314,407 @@ func TestProxyClientOverrides(t *testing.T) {
 func TestProxyClientUnknownHost(t *testing.T) {
 	p := staticProxy(&stubClient{})
 	req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
-	req.Host = "example.com"
 	if _, err := p.Do(req); err == nil {
 		t.Fatal("expected error for unknown host without overrides")
+	}
+}
+
+func TestPayloadHash(t *testing.T) {
+	stub := &stubClient{}
+	p := staticProxy(stub)
+	req := httptest.NewRequest(http.MethodPost, "http://sts.us-east-1.amazonaws.com/", strings.NewReader("hello"))
+	if _, err := p.Do(req); err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	// Known-answer SHA-256 of "hello" rather than a recomputation, so the test
+	// shares no hashing code with the implementation.
+	const wantHash = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+	if got := stub.got.Header.Get("X-Amz-Content-Sha256"); got != wantHash {
+		t.Errorf("X-Amz-Content-Sha256 = %q, want %q", got, wantHash)
+	}
+
+	stub = &stubClient{}
+	p = staticProxy(stub)
+	p.unsignedPayload = true
+	req = httptest.NewRequest(http.MethodPost, "http://sts.us-east-1.amazonaws.com/", strings.NewReader("hello"))
+	if _, err := p.Do(req); err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	if got := stub.got.Header.Get("X-Amz-Content-Sha256"); got != "UNSIGNED-PAYLOAD" {
+		t.Errorf("X-Amz-Content-Sha256 = %q, want UNSIGNED-PAYLOAD", got)
+	}
+}
+
+// signedHeadersFromAuth extracts the SignedHeaders list from an Authorization
+// header value.
+func signedHeadersFromAuth(t *testing.T, auth string) []string {
+	t.Helper()
+	for part := range strings.SplitSeq(auth, ", ") {
+		if v, ok := strings.CutPrefix(part, "SignedHeaders="); ok {
+			return strings.Split(v, ";")
+		}
+	}
+	t.Fatalf("no SignedHeaders in %q", auth)
+	return nil
+}
+
+func TestDeterministicSignature(t *testing.T) {
+	fixed := time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC)
+	stub := &stubClient{}
+	p := staticProxy(stub)
+	p.now = func() time.Time { return fixed }
+
+	const bodyStr = "Action=GetCallerIdentity&Version=2011-06-15"
+	req := httptest.NewRequest(http.MethodPost, "http://sts.us-east-1.amazonaws.com/", strings.NewReader(bodyStr))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if _, err := p.Do(req); err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+
+	// Golden value computed once from this fixed time, static credentials and
+	// request; asserting the exact header keeps the test independent of the
+	// proxy's own signing code, so a canonicalization bug cannot cancel out.
+	const wantAuth = "AWS4-HMAC-SHA256 Credential=AKID/20260702/us-east-1/sts/aws4_request, SignedHeaders=content-length;content-type;host;x-amz-content-sha256;x-amz-date, Signature=8df0e857750592d97116a4c1fa988470bb980d346c2e4c4b84e69af5cdb2fb22"
+	if auth := stub.got.Header.Get("Authorization"); auth != wantAuth {
+		t.Errorf("Authorization = %q, want %q", auth, wantAuth)
+	}
+}
+
+func TestHopByHopStripping(t *testing.T) {
+	// Request side, including a Connection-named extension header.
+	stub := &stubClient{}
+	p := staticProxy(stub)
+	req := httptest.NewRequest(http.MethodGet, "http://sts.us-east-1.amazonaws.com/", nil)
+	req.Header.Set("Connection", "X-Hop")
+	req.Header.Set("X-Hop", "v")
+	req.Header.Set("Keep-Alive", "timeout=5")
+	req.Header.Set("Proxy-Authorization", "secret")
+	req.Header.Set("Te", "trailers")
+	if _, err := p.Do(req); err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	for _, h := range []string{"Connection", "X-Hop", "Keep-Alive", "Proxy-Authorization", "Te"} {
+		if got := stub.got.Header.Get(h); got != "" {
+			t.Errorf("hop-by-hop header %s leaked upstream: %q", h, got)
+		}
+	}
+
+	// Response side: upstream hop-by-hop headers must not reach the caller.
+	respHeader := http.Header{}
+	respHeader.Set("Connection", "X-Resp-Hop")
+	respHeader.Set("X-Resp-Hop", "v")
+	respHeader.Set("Keep-Alive", "timeout=5")
+	respHeader.Set("X-Keep", "yes")
+	stub = &stubClient{resp: &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     respHeader,
+		Body:       io.NopCloser(strings.NewReader("ok")),
+	}}
+	h := &proxyHandler{logger: discardLogger(), proxy: staticProxy(stub)}
+	rec := httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "http://sts.us-east-1.amazonaws.com/", nil)
+	h.ServeHTTP(rec, req)
+	for _, hn := range []string{"Connection", "X-Resp-Hop", "Keep-Alive"} {
+		if got := rec.Header().Get(hn); got != "" {
+			t.Errorf("response hop-by-hop header %s leaked to caller: %q", hn, got)
+		}
+	}
+	if rec.Header().Get("X-Keep") != "yes" {
+		t.Errorf("end-to-end response header dropped, got %v", rec.Header())
+	}
+}
+
+func TestSigningHostOverride(t *testing.T) {
+	stub := &stubClient{}
+	p := staticProxy(stub)
+	p.hostOverride = "upstream.internal"
+	p.schemeOverride = "http"
+	p.signingHostOverride = "signed.example.com"
+	p.serviceOverride = &awsService{signingName: "execute-api", signingRegion: "eu-west-1"}
+
+	req := httptest.NewRequest(http.MethodGet, "http://ignored.example.com/", nil)
+	if _, err := p.Do(req); err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	if stub.got.Host != "signed.example.com" {
+		t.Errorf("Host = %q, want signed.example.com", stub.got.Host)
+	}
+	if stub.got.URL.Host != "upstream.internal" {
+		t.Errorf("URL.Host = %q, want upstream.internal", stub.got.URL.Host)
+	}
+	if !slices.Contains(signedHeadersFromAuth(t, stub.got.Header.Get("Authorization")), "host") {
+		t.Error("host missing from SignedHeaders")
+	}
+}
+
+// A chunked (unknown-length) inbound request must go upstream buffered, with
+// an exact Content-Length and no chunked transfer-encoding: the signer signs
+// content-length whenever ContentLength > 0, and chunked framing would omit
+// the header from the wire (breaking the signature; S3 also rejects chunked).
+func TestChunkedInboundBuffered(t *testing.T) {
+	stub := &stubClient{}
+	p := staticProxy(stub)
+	req := httptest.NewRequest(http.MethodPut, "http://mybucket.s3.us-west-2.amazonaws.com/key", strings.NewReader("hello world"))
+	req.TransferEncoding = []string{"chunked"}
+	req.ContentLength = -1
+	if _, err := p.Do(req); err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	if want := int64(len("hello world")); stub.got.ContentLength != want {
+		t.Errorf("ContentLength = %d, want %d", stub.got.ContentLength, want)
+	}
+	if len(stub.got.TransferEncoding) != 0 {
+		t.Errorf("TransferEncoding = %v, want none", stub.got.TransferEncoding)
+	}
+	if stub.got.GetBody == nil {
+		t.Error("expected a buffered, rewindable body (GetBody != nil)")
+	}
+	if string(stub.body) != "hello world" {
+		t.Errorf("body = %q, want hello world", stub.body)
+	}
+}
+
+// End-to-end variant through real HTTP servers and the real transport: a
+// client upload of unknown length (chunked on the wire) must reach the
+// upstream with a Content-Length and identity framing.
+func TestChunkedInboundIdentityUpstreamE2E(t *testing.T) {
+	var gotCL int64
+	var gotTE []string
+	var gotBody []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotCL = r.ContentLength
+		gotTE = r.TransferEncoding
+		gotBody, _ = io.ReadAll(r.Body)
+	}))
+	defer upstream.Close()
+
+	p := staticProxy(upstream.Client())
+	p.hostOverride = strings.TrimPrefix(upstream.URL, "http://")
+	p.schemeOverride = "http"
+	p.serviceOverride = &awsService{signingName: "s3", signingRegion: "us-east-1"}
+	front := httptest.NewServer(&proxyHandler{logger: discardLogger(), proxy: p})
+	defer front.Close()
+
+	// io.MultiReader hides the length, so the request to the proxy is sent
+	// with Transfer-Encoding: chunked.
+	req, err := http.NewRequest(http.MethodPut, front.URL+"/key", io.MultiReader(strings.NewReader("hello world")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := front.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	if want := int64(len("hello world")); gotCL != want {
+		t.Errorf("upstream ContentLength = %d, want %d", gotCL, want)
+	}
+	if len(gotTE) != 0 {
+		t.Errorf("upstream TransferEncoding = %v, want none", gotTE)
+	}
+	if string(gotBody) != "hello world" {
+		t.Errorf("upstream body = %q, want hello world", gotBody)
+	}
+}
+
+func TestUnsignedPayloadStreams(t *testing.T) {
+	// Known length: the body streams through without a rewind buffer.
+	stub := &stubClient{}
+	p := staticProxy(stub)
+	p.unsignedPayload = true
+	req := httptest.NewRequest(http.MethodPut, "http://mybucket.s3.us-west-2.amazonaws.com/key", strings.NewReader("hello"))
+	if _, err := p.Do(req); err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	if stub.got.GetBody != nil {
+		t.Error("expected streaming body (GetBody == nil)")
+	}
+	if stub.got.ContentLength != 5 {
+		t.Errorf("ContentLength = %d, want 5", stub.got.ContentLength)
+	}
+	if string(stub.body) != "hello" {
+		t.Errorf("body = %q, want hello", stub.body)
+	}
+
+	// Unknown length falls back to buffering so the upstream still receives
+	// an exact Content-Length.
+	stub = &stubClient{}
+	p = staticProxy(stub)
+	p.unsignedPayload = true
+	req = httptest.NewRequest(http.MethodPut, "http://mybucket.s3.us-west-2.amazonaws.com/key", strings.NewReader("hello"))
+	req.TransferEncoding = []string{"chunked"}
+	req.ContentLength = -1
+	if _, err := p.Do(req); err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	if stub.got.GetBody == nil {
+		t.Error("expected buffered fallback (GetBody != nil)")
+	}
+	if stub.got.ContentLength != 5 {
+		t.Errorf("ContentLength = %d, want 5", stub.got.ContentLength)
+	}
+}
+
+func TestSecurityTokenStripped(t *testing.T) {
+	// A stale client-supplied token must not be signed and forwarded.
+	stub := &stubClient{}
+	p := staticProxy(stub)
+	req := httptest.NewRequest(http.MethodGet, "http://sts.us-east-1.amazonaws.com/", nil)
+	req.Header.Set("X-Amz-Security-Token", "stale-client-token")
+	if _, err := p.Do(req); err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	if got := stub.got.Header.Get("X-Amz-Security-Token"); got != "" {
+		t.Errorf("stale client token forwarded: %q", got)
+	}
+
+	// With session credentials the proxy's own token must be used.
+	stub = &stubClient{}
+	p = staticProxy(stub)
+	p.credentials = credentials.NewStaticCredentialsProvider("AKID", "SECRET", "proxy-token")
+	req = httptest.NewRequest(http.MethodGet, "http://sts.us-east-1.amazonaws.com/", nil)
+	req.Header.Set("X-Amz-Security-Token", "stale-client-token")
+	if _, err := p.Do(req); err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	if got := stub.got.Header.Get("X-Amz-Security-Token"); got != "proxy-token" {
+		t.Errorf("X-Amz-Security-Token = %q, want proxy-token", got)
+	}
+}
+
+func TestProxyHandlerErrorResponses(t *testing.T) {
+	// Unknown host: 502 with a generic message revealing no internal detail.
+	stub := &stubClient{}
+	h := &proxyHandler{logger: discardLogger(), proxy: staticProxy(stub)}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "http://secret-internal-host.example.com/", nil)
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusBadGateway)
+	}
+	if rec.Body.String() != "unable to proxy request\n" {
+		t.Errorf("body = %q, must be the generic message", rec.Body.String())
+	}
+	if stub.got != nil {
+		t.Error("request must not be forwarded")
+	}
+
+	// Malformed query strings (which the signer would silently rewrite): 400,
+	// never forwarded.
+	for _, q := range []string{"a=%zz", "a=1;b=2"} {
+		stub.got = nil
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "http://sts.us-east-1.amazonaws.com/?"+q, nil)
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("query %q: status = %d, want %d", q, rec.Code, http.StatusBadRequest)
+		}
+		if stub.got != nil {
+			t.Errorf("query %q was forwarded upstream", q)
+		}
+	}
+
+	// Do surfaces the malformed query as a typed client error.
+	req = httptest.NewRequest(http.MethodGet, "http://sts.us-east-1.amazonaws.com/?a=%zz", nil)
+	if _, err := staticProxy(&stubClient{}).Do(req); err == nil {
+		t.Error("Do: expected error for malformed query")
+	} else if _, ok := errors.AsType[*clientError](err); !ok {
+		t.Errorf("Do error = %v, want *clientError", err)
+	}
+}
+
+func TestPresignedQueryParamsStripped(t *testing.T) {
+	stub := &stubClient{}
+	p := staticProxy(stub)
+	req := httptest.NewRequest(http.MethodGet,
+		"http://mybucket.s3.us-west-2.amazonaws.com/key"+
+			"?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKID%2F20260702%2Fus-west-2%2Fs3%2Faws4_request"+
+			"&X-Amz-Date=20260702T000000Z&X-Amz-Expires=300&X-Amz-SignedHeaders=host"+
+			"&X-Amz-Signature=deadbeef&X-Amz-Security-Token=stale&prefix=data", nil)
+	if _, err := p.Do(req); err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	got := stub.got.URL.Query()
+	for _, param := range []string{
+		"X-Amz-Algorithm", "X-Amz-Credential", "X-Amz-Date", "X-Amz-Expires",
+		"X-Amz-SignedHeaders", "X-Amz-Signature", "X-Amz-Security-Token",
+	} {
+		if got.Has(param) {
+			t.Errorf("presigned auth param %s forwarded upstream: %q", param, got.Get(param))
+		}
+	}
+	if got.Get("prefix") != "data" {
+		t.Errorf("application query param lost, query = %q", stub.got.URL.RawQuery)
+	}
+	if stub.got.Header.Get("Authorization") == "" {
+		t.Error("missing Authorization header on re-signed request")
+	}
+}
+
+func TestBodyReadErrorIsClientError(t *testing.T) {
+	// The failing reader simulates a client that aborts its upload mid-body.
+	req := httptest.NewRequest(http.MethodPost, "http://sts.us-east-1.amazonaws.com/", iotest.ErrReader(errors.New("client went away")))
+	if _, err := staticProxy(&stubClient{}).Do(req); err == nil {
+		t.Error("Do: expected error for failing body read")
+	} else if _, ok := errors.AsType[*clientError](err); !ok {
+		t.Errorf("Do error = %v, want *clientError", err)
+	}
+}
+
+func TestStreamingResponseFlushes(t *testing.T) {
+	tests := []struct {
+		name          string
+		contentLength int64
+		contentType   string
+		wantFlushed   bool
+	}{
+		// Unknown-length upstream responses must be flushed per write.
+		{name: "unknown length", contentLength: -1, wantFlushed: true},
+		// SSE must flush even when a Content-Length is declared.
+		{name: "length-declared event stream", contentLength: 9, contentType: "text/event-stream; charset=utf-8", wantFlushed: true},
+		// Fixed-length responses keep the unflushed fast path.
+		{name: "fixed length", contentLength: 9, wantFlushed: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			header := http.Header{}
+			if tt.contentType != "" {
+				header.Set("Content-Type", tt.contentType)
+			}
+			stub := &stubClient{resp: &http.Response{
+				StatusCode:    http.StatusOK,
+				ContentLength: tt.contentLength,
+				Header:        header,
+				Body:          io.NopCloser(strings.NewReader("data: x\n\n")),
+			}}
+			h := &proxyHandler{logger: discardLogger(), proxy: staticProxy(stub)}
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://sts.us-east-1.amazonaws.com/", nil))
+			if rec.Flushed != tt.wantFlushed {
+				t.Errorf("Flushed = %v, want %v", rec.Flushed, tt.wantFlushed)
+			}
+		})
+	}
+}
+
+func TestParseFlagsRejectsLeftoverArgs(t *testing.T) {
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	if _, err := parseFlags(fs, []string{"--verbose", "false", "--strip", "X"}); err == nil {
+		t.Fatal("expected error for leftover non-flag arguments")
+	}
+
+	fs = flag.NewFlagSet("test", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	o, err := parseFlags(fs, []string{"--verbose", "--strip", "X"})
+	if err != nil {
+		t.Fatalf("valid args rejected: %v", err)
+	}
+	if !o.verbose || len(o.strip) != 1 || o.strip[0] != "X" {
+		t.Errorf("options = %+v, want verbose + strip [X]", o)
 	}
 }
 
@@ -267,7 +735,6 @@ func TestProxyHandlerCopiesResponse(t *testing.T) {
 	h := &proxyHandler{logger: discardLogger(), proxy: p}
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "http://whatever/", nil)
-	req.Host = "whatever"
 	h.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusTeapot {

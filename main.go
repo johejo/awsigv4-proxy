@@ -30,8 +30,7 @@ import (
 	"github.com/aws/smithy-go/logging"
 )
 
-// stringSlice is a flag.Value that accumulates repeated flag occurrences,
-// mirroring kingpin's repeatable Strings() flags (e.g. --strip, --duplicate-headers).
+// stringSlice is a flag.Value that accumulates repeated flag occurrences.
 type stringSlice []string
 
 func (s *stringSlice) String() string { return strings.Join(*s, ",") }
@@ -81,6 +80,15 @@ func parseFlags(fs *flag.FlagSet, args []string) (*options, error) {
 	fs.StringVar(&o.upstreamScheme, "upstream-url-scheme", "", "Protocol to proxy with")
 	fs.BoolVar(&o.unsignedPayload, "unsigned-payload", false, "Prevent signing of the payload")
 	if err := fs.Parse(args); err != nil {
+		return nil, err
+	}
+	if fs.NArg() > 0 {
+		// A bool flag given as "--verbose false" makes "false" a positional
+		// argument, silently terminating flag parsing; without this check
+		// everything after it (e.g. a --strip) would be dropped.
+		err := fmt.Errorf("unexpected non-flag arguments: %q (bool flags do not take a separate value; use --flag=value)", fs.Args())
+		fmt.Fprintln(fs.Output(), err)
+		fs.Usage()
 		return nil, err
 	}
 	return o, nil
@@ -207,9 +215,6 @@ func run(ctx context.Context, o *options, logger *slog.Logger) error {
 	}
 }
 
-// loadAWSConfig loads the default aws-sdk-go-v2 config. Unlike aws-sdk-go v1,
-// this reads the shared config file by default (equivalent to
-// AWS_SDK_LOAD_CONFIG=1) and uses regional STS endpoints by default.
 func loadAWSConfig(ctx context.Context, o *options) (aws.Config, error) {
 	var optFns []func(*config.LoadOptions) error
 	if o.region != "" {
@@ -243,8 +248,7 @@ func parseCustomHeaders(s string, logger *slog.Logger) http.Header {
 	return h
 }
 
-// roleSessionName mirrors the original: prefer AWS_ROLE_SESSION_NAME, otherwise
-// derive from the hostname (or a timestamp), truncated to 64 characters.
+// roleSessionName mirrors the original aws-sigv4-proxy behavior.
 func roleSessionName(hostnameFn func() (string, error)) string {
 	if env := os.Getenv("AWS_ROLE_SESSION_NAME"); env != "" {
 		return env

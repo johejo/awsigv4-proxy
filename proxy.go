@@ -5,13 +5,16 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"maps"
+	"mime"
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/url"
 	"regexp"
 	"slices"
 	"strings"
@@ -40,24 +43,71 @@ type proxyHandler struct {
 func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	resp, err := h.proxy.Do(r)
 	if err != nil {
-		const msg = "unable to proxy request"
+		status, msg := http.StatusBadGateway, "unable to proxy request"
+		if _, ok := errors.AsType[*clientError](err); ok {
+			status, msg = http.StatusBadRequest, "invalid request"
+		}
 		// Log the underlying error (which may reveal internal hosts/IPs) but
 		// return only a generic message to the caller to avoid leaking details.
 		h.logger.Error(msg, "error", err)
-		http.Error(w, msg, http.StatusBadGateway)
+		http.Error(w, msg, status)
 		return
 	}
 	defer resp.Body.Close()
 
-	// Drop hop-by-hop headers and stream the body straight through instead of
-	// buffering it, so large (e.g. multi-GB S3) responses do not sit in memory.
 	delHopByHopHeaders(resp.Header)
 	maps.Copy(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
-	if _, err := io.Copy(w, resp.Body); err != nil {
+
+	// Unknown-length responses and event streams (streaming APIs, SSE) must
+	// reach the client promptly instead of sitting in the server's write
+	// buffer, mirroring httputil.ReverseProxy's immediate-flush conditions.
+	// Fixed-length responses keep the plain path (and its io.Copy fast paths).
+	var dst io.Writer = w
+	if resp.ContentLength == -1 || isEventStream(resp.Header.Get("Content-Type")) {
+		dst = &flushWriter{w: w, rc: http.NewResponseController(w)}
+	}
+	if _, err := io.Copy(dst, resp.Body); err != nil {
 		// Status and headers are already sent, so we can only log here.
 		h.logger.Error("error while copying response from upstream", "error", err)
 	}
+}
+
+// clientError marks failures caused by the inbound request itself; the handler
+// maps these to 400 rather than 502.
+type clientError struct{ err error }
+
+func (e *clientError) Error() string { return e.err.Error() }
+func (e *clientError) Unwrap() error { return e.err }
+
+func isEventStream(contentType string) bool {
+	const mediaType = "text/event-stream"
+	// Cheap prefix check so the common non-SSE response skips the full
+	// (allocating) media-type parse.
+	if len(contentType) < len(mediaType) || !strings.EqualFold(contentType[:len(mediaType)], mediaType) {
+		return false
+	}
+	ct, _, _ := mime.ParseMediaType(contentType)
+	return ct == mediaType
+}
+
+// flushWriter flushes after every write so each chunk of a streaming response
+// is forwarded as soon as it arrives.
+type flushWriter struct {
+	w  io.Writer
+	rc *http.ResponseController
+}
+
+func (fw *flushWriter) Write(p []byte) (int, error) {
+	n, err := fw.w.Write(p)
+	if err != nil {
+		return n, err
+	}
+	if ferr := fw.rc.Flush(); ferr != nil && !errors.Is(ferr, http.ErrNotSupported) {
+		// The client is gone (broken pipe etc.); stop the copy.
+		return n, ferr
+	}
+	return n, nil
 }
 
 // proxyClient signs and forwards a single request.
@@ -76,6 +126,10 @@ type proxyClient struct {
 	logFailedRequest    bool
 	schemeOverride      string
 	unsignedPayload     bool
+
+	// now returns the signing time; nil means time.Now. Injected by tests to
+	// make signatures deterministic.
+	now func() time.Time
 }
 
 func (p *proxyClient) Do(req *http.Request) (*http.Response, error) {
@@ -90,24 +144,67 @@ func (p *proxyClient) Do(req *http.Request) (*http.Response, error) {
 	if p.schemeOverride != "" {
 		proxyURL.Scheme = p.schemeOverride
 	}
+	if req.URL.RawQuery != "" {
+		// SignHTTP re-encodes the query via URL.Query(), which silently DROPS
+		// pairs containing semicolons or invalid percent-escapes — the upstream
+		// would then receive (and we would sign) a different query than the
+		// client sent. Reject such requests outright.
+		query, err := url.ParseQuery(req.URL.RawQuery)
+		if err != nil {
+			return nil, &clientError{fmt.Errorf("invalid query string: %w", err)}
+		}
+		// Drop presigned-URL auth artifacts from the query, mirroring the
+		// X-Amz-Security-Token header strip below: forwarding them alongside
+		// the fresh Authorization header makes AWS reject the request with
+		// "only one auth mechanism allowed". Re-encoding is harmless when
+		// nothing was stripped, since SignHTTP re-encodes the query anyway.
+		stripPresignedQueryParams(query)
+		proxyURL.RawQuery = query.Encode()
+	}
 
-	p.debugDumpRequest(ctx, "initial request dump", req)
+	// The signer needs the payload hash before the headers are written, so the
+	// body must normally be buffered (which also makes it rewindable for
+	// transport retries). With --unsigned-payload the hash is a constant and
+	// the body can stream through — but only when the inbound length is known:
+	// an unknown length would force chunked framing upstream, which S3 rejects
+	// and which drops the signed Content-Length from the wire.
+	stream := p.unsignedPayload && req.ContentLength > 0
 
-	// Buffer the body so it is rewindable (the SDK signer reads it) and so the
-	// request can be retried by the transport.
-	body, err := readRequestBody(req)
+	// Never dump the body on the streaming path: DumpRequest would drain the
+	// whole body into memory, defeating the point of streaming.
+	p.debugDumpRequest(ctx, "initial request dump", req, !stream)
+
+	var body []byte // buffered path only; stays nil when streaming
+	var bodyReader io.Reader
+	if stream {
+		// Used as-is; the transport closes it. The server closes it again
+		// after the handler returns, which is safe (http.body.Close is
+		// idempotent). GetBody stays nil, so the transport cannot retry —
+		// an accepted trade-off for constant memory.
+		bodyReader = req.Body
+	} else {
+		var err error
+		body, err = readRequestBody(req)
+		if err != nil {
+			// A body-read failure at this point is the inbound side (client
+			// aborted the upload, bad chunked framing); nothing upstream is
+			// involved yet.
+			return nil, &clientError{fmt.Errorf("reading request body: %w", err)}
+		}
+		bodyReader = bytes.NewReader(body)
+	}
+
+	proxyReq, err := http.NewRequestWithContext(ctx, req.Method, proxyURL.String(), bodyReader)
 	if err != nil {
 		return nil, err
 	}
-
-	proxyReq, err := http.NewRequestWithContext(ctx, req.Method, proxyURL.String(), bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-
-	reqChunked := chunked(req.TransferEncoding)
-	// Ignore ContentLength if "chunked" transfer-coding is used.
-	if !reqChunked && req.ContentLength >= 0 {
+	if stream {
+		// NewRequestWithContext only derives ContentLength from bytes/strings
+		// readers; for a plain reader it stays 0 (= unknown with a non-nil
+		// body), which would chunk. Set it so identity framing and an
+		// accurate, signed Content-Length go out. On the buffered path the
+		// bytes.Reader already yielded an exact ContentLength, so net/http
+		// never auto-chunks there.
 		proxyReq.ContentLength = req.ContentLength
 	}
 
@@ -123,7 +220,6 @@ func (p *proxyClient) Do(req *http.Request) (*http.Response, error) {
 		return nil, fmt.Errorf("unable to determine service from host: %q (set --name and --region)", req.Host)
 	}
 
-	// Strip requested headers from the incoming request before copying.
 	for _, header := range p.stripHeaders {
 		req.Header.Del(header)
 	}
@@ -135,7 +231,12 @@ func (p *proxyClient) Do(req *http.Request) (*http.Response, error) {
 	proxyReq.Header = req.Header.Clone()
 	delHopByHopHeaders(proxyReq.Header)
 
-	// Duplicate requested headers into an X-Original-* prefixed header.
+	// Drop any caller-supplied security token: the signer only replaces it
+	// when OUR credentials carry a session token, so a stale client token
+	// would otherwise be signed and forwarded, and AWS rejects the request.
+	// Operators can still inject one deliberately via --custom-headers.
+	proxyReq.Header.Del("X-Amz-Security-Token")
+
 	for _, header := range p.duplicateHeaders {
 		v := req.Header.Get(header)
 		if v == "" {
@@ -144,23 +245,18 @@ func (p *proxyClient) Do(req *http.Request) (*http.Response, error) {
 		proxyReq.Header.Set("X-Original-"+header, v)
 	}
 
-	// Add custom headers, without overwriting existing ones.
 	copyHeaderWithoutOverwrite(proxyReq.Header, p.customHeaders)
 
-	// net/http emits "Transfer-Encoding: chunked" when a body is set without a
-	// known length. Force identity so services like S3 (which reject chunked)
-	// receive a Content-Length instead.
-	if !reqChunked {
-		proxyReq.TransferEncoding = []string{"identity"}
-	} else {
-		proxyReq.TransferEncoding = req.TransferEncoding
+	payloadHash := unsignedPayloadHash
+	if !p.unsignedPayload {
+		sum := sha256.Sum256(body)
+		payloadHash = hex.EncodeToString(sum[:])
 	}
-
-	if err := p.sign(ctx, proxyReq, body, svc); err != nil {
+	if err := p.sign(ctx, proxyReq, payloadHash, svc); err != nil {
 		return nil, err
 	}
 
-	p.debugDumpRequest(ctx, "proxying request", proxyReq)
+	p.debugDumpRequest(ctx, "proxying request", proxyReq, !stream)
 
 	resp, err := p.client.Do(proxyReq)
 	if err != nil {
@@ -182,24 +278,22 @@ func (p *proxyClient) Do(req *http.Request) (*http.Response, error) {
 	return resp, nil
 }
 
-func (p *proxyClient) sign(ctx context.Context, req *http.Request, body []byte, svc *awsService) error {
-	payloadHash := unsignedPayloadHash
-	if !p.unsignedPayload {
-		sum := sha256.Sum256(body)
-		payloadHash = hex.EncodeToString(sum[:])
-	}
-
+func (p *proxyClient) sign(ctx context.Context, req *http.Request, payloadHash string, svc *awsService) error {
 	creds, err := p.credentials.Retrieve(ctx)
 	if err != nil {
 		return err
 	}
 
-	// Unlike aws-sdk-go v1's signer, v2's SignHTTP does not set the
-	// X-Amz-Content-Sha256 header itself. Set it before signing (so it is part
-	// of the signature); S3 requires it and it is harmless for other services.
+	// SignHTTP does not set the X-Amz-Content-Sha256 header itself. Set it
+	// before signing (so it is part of the signature); S3 requires it and it
+	// is harmless for other services.
 	req.Header.Set("X-Amz-Content-Sha256", payloadHash)
 
-	err = p.signer.SignHTTP(ctx, creds, req, payloadHash, svc.signingName, svc.signingRegion, time.Now(), func(so *v4.SignerOptions) {
+	signTime := time.Now()
+	if p.now != nil {
+		signTime = p.now()
+	}
+	err = p.signer.SignHTTP(ctx, creds, req, payloadHash, svc.signingName, svc.signingRegion, signTime, func(so *v4.SignerOptions) {
 		so.DisableURIPathEscaping = svc.disableURIPathEscaping()
 	})
 	if err == nil {
@@ -209,11 +303,11 @@ func (p *proxyClient) sign(ctx context.Context, req *http.Request, body []byte, 
 }
 
 // debugDumpRequest logs a full request dump when debug logging is enabled.
-func (p *proxyClient) debugDumpRequest(ctx context.Context, msg string, req *http.Request) {
+func (p *proxyClient) debugDumpRequest(ctx context.Context, msg string, req *http.Request, withBody bool) {
 	if !p.logger.Enabled(ctx, slog.LevelDebug) {
 		return
 	}
-	if dump, err := httputil.DumpRequest(req, true); err == nil {
+	if dump, err := httputil.DumpRequest(req, withBody); err == nil {
 		p.logger.Debug(msg, "request", string(dump))
 	}
 }
@@ -224,6 +318,28 @@ func readRequestBody(req *http.Request) ([]byte, error) {
 	}
 	defer req.Body.Close()
 	return io.ReadAll(req.Body)
+}
+
+// presignedQueryParams are the SigV4 query-auth parameters carried by
+// presigned URLs (X-Amz-Algorithm, X-Amz-Credential, ...), lowercased for
+// case-insensitive lookup.
+var presignedQueryParams = map[string]bool{
+	"x-amz-algorithm":      true,
+	"x-amz-credential":     true,
+	"x-amz-date":           true,
+	"x-amz-expires":        true,
+	"x-amz-signedheaders":  true,
+	"x-amz-signature":      true,
+	"x-amz-security-token": true,
+}
+
+// stripPresignedQueryParams removes presigned-URL auth parameters from q.
+func stripPresignedQueryParams(q url.Values) {
+	for k := range q {
+		if presignedQueryParams[strings.ToLower(k)] {
+			delete(q, k)
+		}
+	}
 }
 
 func copyHeaderWithoutOverwrite(dst, src http.Header) {
@@ -275,17 +391,6 @@ func spliceBody(prefix []byte, body io.ReadCloser) io.ReadCloser {
 	}{io.MultiReader(bytes.NewReader(prefix), body), body}
 }
 
-// chunked reports whether the transfer-encoding implies chunked framing (any
-// value other than "identity"), per RFC 2616 sections 3.6 and 4.4.
-func chunked(transferEncoding []string) bool {
-	for _, v := range transferEncoding {
-		if v != "identity" {
-			return true
-		}
-	}
-	return false
-}
-
 // awsService is the minimal signing information needed for SigV4.
 type awsService struct {
 	signingName   string
@@ -310,11 +415,15 @@ func isRegion(s string) bool { return regionRe.MatchString(s) }
 // apply.
 type hostMatcher func(labels []string) *awsService
 
-// hostMatchers is ordered most-specific first; the first match wins.
+// hostMatchers handle disjoint domain families; the first match wins.
 var hostMatchers = []hostMatcher{
 	matchOnAws,
 	matchAmazonAws,
 }
+
+// signingNameRe matches plausible SigV4 signing names; anything else derived
+// from a host is a bucket name, typo or garbage, not a real AWS service.
+var signingNameRe = regexp.MustCompile(`^[a-z0-9-]+$`)
 
 // determineAWSServiceFromHost derives the signing service and region from an
 // endpoint host. It replaces aws-sdk-go v1's built-in endpoints table (which
@@ -333,6 +442,9 @@ func determineAWSServiceFromHost(host string) *awsService {
 	}
 	for _, m := range hostMatchers {
 		if svc := m(labels); svc != nil {
+			if !signingNameRe.MatchString(svc.signingName) {
+				return nil
+			}
 			return svc
 		}
 	}
@@ -366,37 +478,27 @@ func matchAmazonAws(labels []string) *awsService {
 		return nil
 	}
 
+	// S3 determines its region positionally (a dotted bucket name may contain
+	// region-shaped labels), so it must run before the findRegion-based rules.
+	if svc := matchS3(rest); svc != nil {
+		return svc
+	}
+
 	region := findRegion(rest)
 	if region == "" {
-		// Legacy single-label path-style S3: s3-<region>.amazonaws.com. The
-		// s3- prefix keeps the label from matching regionRe, so these hosts
-		// always land here rather than in the regional rules below.
-		if len(rest) == 1 {
-			if r := strings.TrimPrefix(rest[0], "s3-"); r != rest[0] && isRegion(r) {
-				return &awsService{signingName: "s3", signingRegion: r}
-			}
-		}
 		// Region-less global endpoints (e.g. iam.amazonaws.com,
-		// sts.amazonaws.com, s3.amazonaws.com) sign against us-east-1.
-		if svc := normalizeService(rest[len(rest)-1]); globalServices[svc] {
-			return &awsService{signingName: svc, signingRegion: "us-east-1"}
+		// sts.amazonaws.com) sign against a fixed region.
+		svc := normalizeService(rest[len(rest)-1])
+		if r, ok := globalServices[svc]; ok {
+			return &awsService{signingName: svc, signingRegion: r}
 		}
 		return nil
 	}
 
-	// OpenSearch/Elasticsearch: <domain>.<region>.es.amazonaws.com — the
-	// service label is last rather than immediately before the region.
-	if rest[len(rest)-1] == "es" {
-		return &awsService{signingName: "es", signingRegion: region}
-	}
-
-	// S3 in any of its forms: s3.<region>, <bucket>.s3.<region>,
-	// <bucket>.s3.dualstack.<region>, plus FIPS/access-point/object-lambda/
-	// outposts variants.
-	for _, l := range rest {
-		if name, ok := s3Labels[l]; ok {
-			return &awsService{signingName: name, signingRegion: region}
-		}
+	// Services that put their label last rather than immediately before the
+	// region: <domain>.<region>.<service-label>.amazonaws.com.
+	if name, ok := lastLabelServices[rest[len(rest)-1]]; ok {
+		return &awsService{signingName: name, signingRegion: region}
 	}
 
 	// Generic: [...].<service>.<region>.amazonaws.com — region is the last
@@ -404,7 +506,54 @@ func matchAmazonAws(labels []string) *awsService {
 	if len(rest) < 2 || rest[len(rest)-1] != region {
 		return nil
 	}
-	return &awsService{signingName: normalizeService(rest[len(rest)-2]), signingRegion: region}
+	name := normalizeService(rest[len(rest)-2])
+	// IoT hosts with labels before "iot" are data planes with their own
+	// signing names; only match the documented shapes and refuse to guess for
+	// the rest (e.g. <prefix>.credentials.iot.<region>, which does not use
+	// SigV4 at all). The bare control-plane endpoint iot.<region> signs "iot".
+	if name == "iot" && len(rest) > 2 {
+		switch prev := rest[len(rest)-3]; {
+		case len(rest) == 3 && (prev == "data" || strings.HasSuffix(prev, "-ats")):
+			// data.iot.<region>, <prefix>-ats.iot.<region>
+			name = "iotdata"
+		case len(rest) == 4 && rest[0] == "data" && rest[1] == "jobs":
+			// data.jobs.iot.<region>
+			name = "iot-jobs-data"
+		default:
+			return nil
+		}
+	}
+	return &awsService{signingName: name, signingRegion: region}
+}
+
+// matchS3 handles the S3 endpoint family (s3Labels plus the legacy dashed form
+// s3-<region>). Labels before the right-most s3-family label belong to the
+// bucket or access-point name, which may itself be dotted or region-shaped, so
+// the region is searched only in the suffix after it. No suffix at all is the
+// legacy global endpoint (us-east-1); a suffix without a region is not a known
+// S3 form and must not sign as global S3.
+func matchS3(rest []string) *awsService {
+	for i := len(rest) - 1; i >= 0; i-- {
+		name, ok := s3Labels[rest[i]]
+		if !ok {
+			// Legacy dashed form, where the label carries its own region:
+			// s3-<region>. The s3- prefix keeps it from matching regionRe
+			// or s3Labels.
+			if r := strings.TrimPrefix(rest[i], "s3-"); r != rest[i] && isRegion(r) {
+				return &awsService{signingName: "s3", signingRegion: r}
+			}
+			continue
+		}
+		suffix := rest[i+1:]
+		if len(suffix) == 0 {
+			return &awsService{signingName: name, signingRegion: "us-east-1"}
+		}
+		if r := findRegion(suffix); r != "" {
+			return &awsService{signingName: name, signingRegion: r}
+		}
+		return nil
+	}
+	return nil
 }
 
 // amazonAWSRest strips the amazonaws.com / amazonaws.com.cn suffix, returning
@@ -431,23 +580,48 @@ var s3Labels = map[string]string{
 	"s3-outposts":         "s3-outposts",
 }
 
-// globalServices are region-less AWS endpoints that sign against us-east-1.
-var globalServices = map[string]bool{
-	"iam":           true,
-	"sts":           true,
-	"s3":            true,
-	"cloudfront":    true,
-	"route53":       true,
-	"waf":           true,
-	"organizations": true,
+// globalServices are region-less AWS endpoints, keyed by normalized service
+// label (which is also the SigV4 signing name), with the fixed region they
+// sign against.
+var globalServices = map[string]string{
+	"iam":               "us-east-1",
+	"sts":               "us-east-1",
+	"cloudfront":        "us-east-1",
+	"route53":           "us-east-1",
+	"waf":               "us-east-1",
+	"organizations":     "us-east-1",
+	"globalaccelerator": "us-west-2",
+	"sqs":               "us-east-1", // legacy queue.amazonaws.com, via the queue alias
+}
+
+// lastLabelServices maps services whose endpoint hosts end in the service
+// label, with the region before it (e.g. <domain>.<region>.es), to their
+// SigV4 signing names.
+var lastLabelServices = map[string]string{
+	"es":          "es",
+	"aoss":        "aoss",
+	"cloudsearch": "cloudsearch",
+	"queue":       "sqs", // legacy regional SQS: <region>.queue
+}
+
+// serviceAliases maps endpoint host labels whose SigV4 signing name differs
+// from the label itself (per botocore's service metadata).
+var serviceAliases = map[string]string{
+	"aps-workspaces":      "aps",
+	"email":               "ses",
+	"appstream2":          "appstream",
+	"transcribestreaming": "transcribe",
+	"appsync-api":         "appsync", // <api-id>.appsync-api.<region>
+	"s3-control":          "s3",
+	"queue":               "sqs", // legacy global SQS: queue.amazonaws.com
 }
 
 // normalizeService maps an endpoint's service label to its SigV4 signing name,
 // stripping the -fips suffix and translating known aliases.
 func normalizeService(s string) string {
 	s = strings.TrimSuffix(s, "-fips")
-	if s == "aps-workspaces" {
-		return "aps"
+	if alias, ok := serviceAliases[s]; ok {
+		return alias
 	}
 	return s
 }
