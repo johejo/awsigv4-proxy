@@ -139,6 +139,7 @@ func run(ctx context.Context, o *options, logger *slog.Logger) error {
 
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.IdleConnTimeout = o.idleConnTimeout
+	transport.MaxIdleConnsPerHost = 100
 	if o.noVerifySSL {
 		logger.Warn("Peer SSL Certificate validation is DISABLED")
 		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
