@@ -41,22 +41,25 @@ func (s *stringSlice) Set(v string) error {
 }
 
 type options struct {
-	verbose          bool
-	logFailedRequest bool
-	logSigning       bool
-	port             string
-	strip            stringSlice
-	customHeaders    string
-	duplicateHeaders stringSlice
-	roleArn          string
-	name             string
-	signHost         string
-	host             string
-	region           string
-	noVerifySSL      bool
-	idleConnTimeout  time.Duration
-	upstreamScheme   string
-	unsignedPayload  bool
+	verbose             bool
+	logFailedRequest    bool
+	logSigning          bool
+	port                string
+	strip               stringSlice
+	customHeaders       string
+	duplicateHeaders    stringSlice
+	roleArn             string
+	name                string
+	signHost            string
+	host                string
+	region              string
+	noVerifySSL         bool
+	idleConnTimeout     time.Duration
+	maxIdleConns        int
+	maxIdleConnsPerHost int
+	maxConnsPerHost     int
+	upstreamScheme      string
+	unsignedPayload     bool
 }
 
 func parseFlags(fs *flag.FlagSet, args []string) (*options, error) {
@@ -77,6 +80,9 @@ func parseFlags(fs *flag.FlagSet, args []string) (*options, error) {
 	fs.StringVar(&o.region, "region", "", "AWS region to sign for")
 	fs.BoolVar(&o.noVerifySSL, "no-verify-ssl", false, "Disable peer SSL certificate validation")
 	fs.DurationVar(&o.idleConnTimeout, "transport.idle-conn-timeout", 40*time.Second, "Idle timeout to the upstream service")
+	fs.IntVar(&o.maxIdleConns, "transport.max-idle-conns", 100, "Maximum number of idle connections to the upstream service across all hosts (0 means no limit)")
+	fs.IntVar(&o.maxIdleConnsPerHost, "transport.max-idle-conns-per-host", 100, "Maximum number of idle connections to the upstream service per host (0 means Go's default of 2)")
+	fs.IntVar(&o.maxConnsPerHost, "transport.max-conns-per-host", 0, "Maximum number of connections to the upstream service per host, including active, dialing and idle ones (0 means no limit)")
 	fs.StringVar(&o.upstreamScheme, "upstream-url-scheme", "", "Protocol to proxy with")
 	fs.BoolVar(&o.unsignedPayload, "unsigned-payload", false, "Prevent signing of the payload")
 	if err := fs.Parse(args); err != nil {
@@ -139,7 +145,9 @@ func run(ctx context.Context, o *options, logger *slog.Logger) error {
 
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.IdleConnTimeout = o.idleConnTimeout
-	transport.MaxIdleConnsPerHost = 100
+	transport.MaxIdleConns = o.maxIdleConns
+	transport.MaxIdleConnsPerHost = o.maxIdleConnsPerHost
+	transport.MaxConnsPerHost = o.maxConnsPerHost
 	if o.noVerifySSL {
 		logger.Warn("Peer SSL Certificate validation is DISABLED")
 		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}

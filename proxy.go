@@ -84,7 +84,7 @@ func isEventStream(contentType string) bool {
 	const mediaType = "text/event-stream"
 	// Cheap prefix check so the common non-SSE response skips the full
 	// (allocating) media-type parse.
-	if len(contentType) < len(mediaType) || !strings.EqualFold(contentType[:len(mediaType)], mediaType) {
+	if !hasPrefixFold(contentType, mediaType) {
 		return false
 	}
 	ct, _, _ := mime.ParseMediaType(contentType)
@@ -220,15 +220,15 @@ func (p *proxyClient) Do(req *http.Request) (*http.Response, error) {
 		return nil, fmt.Errorf("unable to determine service from host: %q (set --name and --region)", req.Host)
 	}
 
-	for _, header := range p.stripHeaders {
-		req.Header.Del(header)
-	}
-
 	// Copy the caller's headers onto the proxy request, then drop hop-by-hop
 	// headers. This happens BEFORE signing so the caller's headers (notably
 	// x-amz-*, which AWS requires to be part of the signature) are included in
-	// the SigV4 signed headers.
+	// the SigV4 signed headers. Strip on the clone, not on req.Header:
+	// handlers must not modify the inbound request (http.Handler contract).
 	proxyReq.Header = req.Header.Clone()
+	for _, header := range p.stripHeaders {
+		proxyReq.Header.Del(header)
+	}
 	delHopByHopHeaders(proxyReq.Header)
 
 	// Drop any caller-supplied security token: the signer only replaces it
@@ -237,12 +237,21 @@ func (p *proxyClient) Do(req *http.Request) (*http.Response, error) {
 	// Operators can still inject one deliberately via --custom-headers.
 	proxyReq.Header.Del("X-Amz-Security-Token")
 
+	// X-Original-* is a proxy-owned namespace: drop every caller-supplied value
+	// (spoofed headers would otherwise be signed and forwarded as if we attested
+	// them), then repopulate from the configured duplicate headers. Strip wins:
+	// a header listed in both --strip and --duplicate-headers is not preserved.
+	maps.DeleteFunc(proxyReq.Header, func(k string, _ []string) bool {
+		return hasPrefixFold(k, "X-Original-")
+	})
 	for _, header := range p.duplicateHeaders {
-		v := req.Header.Get(header)
-		if v == "" {
+		if slices.ContainsFunc(p.stripHeaders, func(s string) bool { return strings.EqualFold(s, header) }) {
 			continue
 		}
-		proxyReq.Header.Set("X-Original-"+header, v)
+		key := "X-Original-" + header
+		for _, v := range req.Header.Values(header) {
+			proxyReq.Header.Add(key, v)
+		}
 	}
 
 	copyHeaderWithoutOverwrite(proxyReq.Header, p.customHeaders)
@@ -351,6 +360,11 @@ func copyHeaderWithoutOverwrite(dst, src http.Header) {
 			dst.Add(k, v)
 		}
 	}
+}
+
+// hasPrefixFold is a case-insensitive strings.HasPrefix.
+func hasPrefixFold(s, prefix string) bool {
+	return len(s) >= len(prefix) && strings.EqualFold(s[:len(prefix)], prefix)
 }
 
 // hopByHopHeaders are consumed by a single transport-level connection and must

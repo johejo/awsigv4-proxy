@@ -277,12 +277,10 @@ func TestProxyClientOverrides(t *testing.T) {
 	p.serviceOverride = &awsService{signingName: "execute-api", signingRegion: "eu-west-1"}
 	p.schemeOverride = "http"
 	p.stripHeaders = []string{"Authorization-Downstream"}
-	p.duplicateHeaders = []string{"X-Trace"}
 	p.customHeaders = http.Header{"X-Custom": []string{"yes"}}
 
 	req := httptest.NewRequest(http.MethodPost, "http://ignored.example.com/path", strings.NewReader("payload"))
 	req.Header.Set("Authorization-Downstream", "secret")
-	req.Header.Set("X-Trace", "abc")
 
 	if _, err := p.Do(req); err != nil {
 		t.Fatalf("Do: %v", err)
@@ -300,14 +298,81 @@ func TestProxyClientOverrides(t *testing.T) {
 	if stub.got.Header.Get("Authorization-Downstream") != "" {
 		t.Errorf("stripped header leaked through: %q", stub.got.Header.Get("Authorization-Downstream"))
 	}
-	if stub.got.Header.Get("X-Original-X-Trace") != "abc" {
-		t.Errorf("duplicated header = %q, want abc", stub.got.Header.Get("X-Original-X-Trace"))
+	// Stripping must happen on the outbound clone; the inbound request is not
+	// ours to modify (http.Handler contract).
+	if req.Header.Get("Authorization-Downstream") != "secret" {
+		t.Errorf("inbound request header mutated: %q", req.Header.Get("Authorization-Downstream"))
 	}
 	if stub.got.Header.Get("X-Custom") != "yes" {
 		t.Errorf("custom header = %q, want yes", stub.got.Header.Get("X-Custom"))
 	}
 	if string(stub.body) != "payload" {
 		t.Errorf("body = %q, want payload", string(stub.body))
+	}
+}
+
+func TestProxyClientDuplicateHeadersMultiValue(t *testing.T) {
+	stub := &stubClient{}
+	p := staticProxy(stub)
+	p.serviceOverride = &awsService{signingName: "execute-api", signingRegion: "eu-west-1"}
+	p.duplicateHeaders = []string{"X-Trace", "X-Absent", "X-Empty"}
+
+	req := httptest.NewRequest(http.MethodGet, "http://upstream.example.com/", nil)
+	req.Header.Add("X-Trace", "abc")
+	req.Header.Add("X-Trace", "def")
+	req.Header.Set("X-Empty", "")
+	// Caller-supplied X-Original-* headers must never survive: replaced when
+	// the source header is present, dropped when it is absent or unconfigured.
+	req.Header.Set("X-Original-X-Trace", "spoofed")
+	req.Header.Set("X-Original-X-Absent", "spoofed")
+	req.Header.Set("X-Original-Other", "spoofed")
+	req.Header["x-original-lowercase"] = []string{"spoofed"}
+
+	if _, err := p.Do(req); err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+
+	if got, want := stub.got.Header.Values("X-Original-X-Trace"), []string{"abc", "def"}; !slices.Equal(got, want) {
+		t.Errorf("duplicated header = %q, want %q", got, want)
+	}
+	// A present-but-empty source header is still duplicated (presence is
+	// preserved, and an empty spoof cannot slip through in its place).
+	if got, want := stub.got.Header.Values("X-Original-X-Empty"), []string{""}; !slices.Equal(got, want) {
+		t.Errorf("empty header duplicated as %q, want %q", got, want)
+	}
+	// Check map presence, not Values length: a nil-valued entry would pass a
+	// len(Values) == 0 check.
+	if got, ok := stub.got.Header["X-Original-X-Absent"]; ok {
+		t.Errorf("spoofed X-Original-X-Absent survived: %q", got)
+	}
+	if got, ok := stub.got.Header["X-Original-Other"]; ok {
+		t.Errorf("spoofed X-Original-Other survived: %q", got)
+	}
+	if got, ok := stub.got.Header["x-original-lowercase"]; ok {
+		t.Errorf("spoofed lowercase x-original-lowercase survived: %q", got)
+	}
+}
+
+func TestProxyClientDuplicateHeadersAfterStrip(t *testing.T) {
+	stub := &stubClient{}
+	p := staticProxy(stub)
+	p.serviceOverride = &awsService{signingName: "execute-api", signingRegion: "eu-west-1"}
+	p.stripHeaders = []string{"X-Trace"}
+	p.duplicateHeaders = []string{"X-Trace"}
+
+	req := httptest.NewRequest(http.MethodGet, "http://upstream.example.com/", nil)
+	req.Header.Set("X-Trace", "abc")
+	req.Header.Set("X-Original-X-Trace", "spoofed")
+
+	if _, err := p.Do(req); err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+
+	if got := stub.got.Header.Get("X-Trace"); got != "" {
+		t.Errorf("stripped source header leaked through: %q", got)
+	}
+	if got, ok := stub.got.Header["X-Original-X-Trace"]; ok {
+		t.Errorf("stripped header was duplicated or spoof survived: %q", got)
 	}
 }
 
@@ -700,16 +765,19 @@ func TestStreamingResponseFlushes(t *testing.T) {
 	}
 }
 
-func TestParseFlagsRejectsLeftoverArgs(t *testing.T) {
+// parseFlagsForTest runs parseFlags with a quiet throwaway FlagSet.
+func parseFlagsForTest(args ...string) (*options, error) {
 	fs := flag.NewFlagSet("test", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	if _, err := parseFlags(fs, []string{"--verbose", "false", "--strip", "X"}); err == nil {
+	return parseFlags(fs, args)
+}
+
+func TestParseFlagsRejectsLeftoverArgs(t *testing.T) {
+	if _, err := parseFlagsForTest("--verbose", "false", "--strip", "X"); err == nil {
 		t.Fatal("expected error for leftover non-flag arguments")
 	}
 
-	fs = flag.NewFlagSet("test", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	o, err := parseFlags(fs, []string{"--verbose", "--strip", "X"})
+	o, err := parseFlagsForTest("--verbose", "--strip", "X")
 	if err != nil {
 		t.Fatalf("valid args rejected: %v", err)
 	}
