@@ -60,6 +60,7 @@ type options struct {
 	maxConnsPerHost     int
 	upstreamScheme      string
 	unsignedPayload     bool
+	maxRequestBodySize  int64
 }
 
 func parseFlags(fs *flag.FlagSet, args []string) (*options, error) {
@@ -85,6 +86,7 @@ func parseFlags(fs *flag.FlagSet, args []string) (*options, error) {
 	fs.IntVar(&o.maxConnsPerHost, "transport.max-conns-per-host", 0, "Maximum number of connections to the upstream service per host, including active, dialing and idle ones (0 means no limit)")
 	fs.StringVar(&o.upstreamScheme, "upstream-url-scheme", "", "Protocol to proxy with")
 	fs.BoolVar(&o.unsignedPayload, "unsigned-payload", false, "Prevent signing of the payload")
+	fs.Int64Var(&o.maxRequestBodySize, "max-request-body-size", 0, "Maximum inbound request body size in bytes; larger requests are rejected with 413 (0 means no limit)")
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
@@ -190,6 +192,7 @@ func run(ctx context.Context, o *options, logger *slog.Logger) error {
 			logFailedRequest:    o.logFailedRequest || o.verbose,
 			schemeOverride:      o.upstreamScheme,
 			unsignedPayload:     o.unsignedPayload,
+			maxBodySize:         o.maxRequestBodySize,
 		},
 	}
 

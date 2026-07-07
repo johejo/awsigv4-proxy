@@ -46,6 +46,9 @@ func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		status, msg := http.StatusBadGateway, "unable to proxy request"
 		if _, ok := errors.AsType[*clientError](err); ok {
 			status, msg = http.StatusBadRequest, "invalid request"
+			if errors.Is(err, errBodyTooLarge) {
+				status, msg = http.StatusRequestEntityTooLarge, "request body too large"
+			}
 		}
 		// Log the underlying error (which may reveal internal hosts/IPs) but
 		// return only a generic message to the caller to avoid leaking details.
@@ -79,6 +82,10 @@ type clientError struct{ err error }
 
 func (e *clientError) Error() string { return e.err.Error() }
 func (e *clientError) Unwrap() error { return e.err }
+
+// errBodyTooLarge marks inbound requests rejected by --max-request-body-size;
+// always wrapped in a clientError, and mapped by the handler to 413.
+var errBodyTooLarge = errors.New("request body exceeds --max-request-body-size")
 
 func isEventStream(contentType string) bool {
 	const mediaType = "text/event-stream"
@@ -126,6 +133,7 @@ type proxyClient struct {
 	logFailedRequest    bool
 	schemeOverride      string
 	unsignedPayload     bool
+	maxBodySize         int64
 
 	// now returns the signing time; nil means time.Now. Injected by tests to
 	// make signatures deterministic.
@@ -162,6 +170,14 @@ func (p *proxyClient) Do(req *http.Request) (*http.Response, error) {
 		proxyURL.RawQuery = query.Encode()
 	}
 
+	// A declared length over the cap is rejected before any body is read; a
+	// chunked (unknown-length) body is instead capped during the buffered read
+	// below. The streaming path always has a declared length, so this check
+	// alone covers it.
+	if p.maxBodySize > 0 && req.ContentLength > p.maxBodySize {
+		return nil, &clientError{fmt.Errorf("declared request body of %d bytes: %w", req.ContentLength, errBodyTooLarge)}
+	}
+
 	// The signer needs the payload hash before the headers are written, so the
 	// body must normally be buffered (which also makes it rewindable for
 	// transport retries). With --unsigned-payload the hash is a constant and
@@ -184,7 +200,7 @@ func (p *proxyClient) Do(req *http.Request) (*http.Response, error) {
 		bodyReader = req.Body
 	} else {
 		var err error
-		body, err = readRequestBody(req)
+		body, err = readRequestBody(req, p.maxBodySize)
 		if err != nil {
 			// A body-read failure at this point is the inbound side (client
 			// aborted the upload, bad chunked framing); nothing upstream is
@@ -321,12 +337,25 @@ func (p *proxyClient) debugDumpRequest(ctx context.Context, msg string, req *htt
 	}
 }
 
-func readRequestBody(req *http.Request) ([]byte, error) {
+// readRequestBody buffers the request body. With a positive limit it fails
+// with errBodyTooLarge as soon as more than limit bytes arrive, so a chunked
+// body (whose length is unknown upfront) never buffers more than the cap.
+func readRequestBody(req *http.Request, limit int64) ([]byte, error) {
 	if req.Body == nil {
 		return nil, nil
 	}
 	defer req.Body.Close()
-	return io.ReadAll(req.Body)
+	if limit <= 0 {
+		return io.ReadAll(req.Body)
+	}
+	body, err := io.ReadAll(io.LimitReader(req.Body, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(body)) > limit {
+		return nil, errBodyTooLarge
+	}
+	return body, nil
 }
 
 // presignedQueryParams are the SigV4 query-auth parameters carried by

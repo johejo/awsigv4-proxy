@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"flag"
 	"io"
@@ -716,6 +717,104 @@ func TestPresignedQueryParamsStripped(t *testing.T) {
 	}
 	if stub.got.Header.Get("Authorization") == "" {
 		t.Error("missing Authorization header on re-signed request")
+	}
+}
+
+func TestMaxRequestBodySize(t *testing.T) {
+	overLimit := func(t *testing.T, p *proxyClient, req *http.Request) {
+		t.Helper()
+		stub := p.client.(*stubClient)
+		_, err := p.Do(req)
+		if !errors.Is(err, errBodyTooLarge) {
+			t.Fatalf("Do error = %v, want errBodyTooLarge", err)
+		}
+		if _, ok := errors.AsType[*clientError](err); !ok {
+			t.Errorf("Do error = %v, want *clientError", err)
+		}
+		if stub.got != nil {
+			t.Error("over-limit request was forwarded upstream")
+		}
+	}
+
+	// Declared Content-Length over the limit: rejected before reading the body.
+	p := staticProxy(&stubClient{})
+	p.maxBodySize = 4
+	overLimit(t, p, httptest.NewRequest(http.MethodPost, "http://sts.us-east-1.amazonaws.com/", strings.NewReader("hello")))
+
+	// Chunked (unknown-length) body over the limit: caught during the buffered
+	// read, which must not buffer more than the cap.
+	p = staticProxy(&stubClient{})
+	p.maxBodySize = 4
+	req := httptest.NewRequest(http.MethodPost, "http://sts.us-east-1.amazonaws.com/", strings.NewReader("hello"))
+	req.TransferEncoding = []string{"chunked"}
+	req.ContentLength = -1
+	overLimit(t, p, req)
+
+	// The streaming (unsigned payload) path has no buffered read, so the
+	// declared-length check must cover it.
+	p = staticProxy(&stubClient{})
+	p.maxBodySize = 4
+	p.unsignedPayload = true
+	overLimit(t, p, httptest.NewRequest(http.MethodPost, "http://sts.us-east-1.amazonaws.com/", strings.NewReader("hello")))
+
+	// A body exactly at the limit passes through intact.
+	stub := &stubClient{}
+	p = staticProxy(stub)
+	p.maxBodySize = 5
+	if _, err := p.Do(httptest.NewRequest(http.MethodPost, "http://sts.us-east-1.amazonaws.com/", strings.NewReader("hello"))); err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	if string(stub.body) != "hello" {
+		t.Errorf("body = %q, want hello", stub.body)
+	}
+
+	// The handler maps the rejection to 413 with a generic message.
+	p = staticProxy(&stubClient{})
+	p.maxBodySize = 4
+	h := &proxyHandler{logger: discardLogger(), proxy: p}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "http://sts.us-east-1.amazonaws.com/", strings.NewReader("hello")))
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusRequestEntityTooLarge)
+	}
+	if rec.Body.String() != "request body too large\n" {
+		t.Errorf("body = %q, must be the generic message", rec.Body.String())
+	}
+}
+
+// The log-failed-requests path must log only a bounded prefix of the error
+// body while the caller still receives the complete body.
+func TestLogFailedRequestPreservesBody(t *testing.T) {
+	const maxLogBody = 64 << 10 // mirrors the cap in Do
+	bodyStr := strings.Repeat("a", maxLogBody) + "TAIL"
+	stub := &stubClient{resp: &http.Response{
+		StatusCode: http.StatusInternalServerError,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(bodyStr)),
+	}}
+	var logBuf bytes.Buffer
+	p := staticProxy(stub)
+	p.logger = slog.New(slog.NewTextHandler(&logBuf, nil))
+	p.logFailedRequest = true
+
+	resp, err := p.Do(httptest.NewRequest(http.MethodGet, "http://sts.us-east-1.amazonaws.com/", nil))
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	defer resp.Body.Close()
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading spliced body: %v", err)
+	}
+	if string(got) != bodyStr {
+		t.Errorf("caller body corrupted: len %d, want %d", len(got), len(bodyStr))
+	}
+	logged := logBuf.String()
+	if !strings.Contains(logged, "status_code=500") {
+		t.Errorf("failed request not logged: %q", logged)
+	}
+	if strings.Contains(logged, "TAIL") {
+		t.Error("log contains bytes beyond the 64KiB cap")
 	}
 }
 
