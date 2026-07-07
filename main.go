@@ -171,10 +171,7 @@ func run(ctx context.Context, o *options, logger *slog.Logger) error {
 		}
 	})
 
-	var serviceOverride *awsService
-	if o.name != "" && o.region != "" {
-		serviceOverride = &awsService{signingName: o.name, signingRegion: o.region}
-	}
+	serviceOverride := serviceOverrideFromFlags(o, logger)
 
 	handler := &proxyHandler{
 		logger: logger,
@@ -225,6 +222,22 @@ func run(ctx context.Context, o *options, logger *slog.Logger) error {
 		defer cancel()
 		return srv.Shutdown(shutdownCtx)
 	}
+}
+
+// serviceOverrideFromFlags builds the signing override from --name/--region.
+// Both are required, mirroring the original aws-sigv4-proxy; --name alone is a
+// no-op there too, but silently, so warn about the likely misconfiguration.
+// --region alone is legitimate (it selects the region for credential
+// resolution, e.g. the regional STS endpoint with --role-arn) and gets no
+// warning.
+func serviceOverrideFromFlags(o *options, logger *slog.Logger) *awsService {
+	if o.name != "" && o.region != "" {
+		return &awsService{signingName: o.name, signingRegion: o.region}
+	}
+	if o.name != "" {
+		logger.Warn("--name is ignored without --region; signing service and region will be derived from each request's Host header")
+	}
+	return nil
 }
 
 func loadAWSConfig(ctx context.Context, o *options) (aws.Config, error) {

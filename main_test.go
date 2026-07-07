@@ -204,6 +204,36 @@ func TestCopyHeaderWithoutOverwrite(t *testing.T) {
 	}
 }
 
+func TestServiceOverrideFromFlags(t *testing.T) {
+	warned := func(o *options) (svc *awsService, warning bool) {
+		var buf bytes.Buffer
+		svc = serviceOverrideFromFlags(o, slog.New(slog.NewTextHandler(&buf, nil)))
+		return svc, strings.Contains(buf.String(), "level=WARN")
+	}
+
+	svc, warning := warned(&options{name: "execute-api", region: "eu-west-1"})
+	if svc == nil || svc.signingName != "execute-api" || svc.signingRegion != "eu-west-1" {
+		t.Errorf("override = %+v, want execute-api/eu-west-1", svc)
+	}
+	if warning {
+		t.Error("unexpected warning for --name with --region")
+	}
+
+	// --name alone is ignored (original behavior), but must warn.
+	if svc, warning := warned(&options{name: "execute-api"}); svc != nil || !warning {
+		t.Errorf("override = %+v, warning = %v; want nil with a warning", svc, warning)
+	}
+
+	// --region alone is a valid credential-resolution setting: no warning.
+	if svc, warning := warned(&options{region: "eu-west-1"}); svc != nil || warning {
+		t.Errorf("override = %+v, warning = %v; want nil without warning", svc, warning)
+	}
+
+	if svc, warning := warned(&options{}); svc != nil || warning {
+		t.Errorf("override = %+v, warning = %v; want nil without warning", svc, warning)
+	}
+}
+
 func TestRoleSessionName(t *testing.T) {
 	t.Setenv("AWS_ROLE_SESSION_NAME", "custom-session")
 	if got := roleSessionName(func() (string, error) { return "host", nil }); got != "custom-session" {
