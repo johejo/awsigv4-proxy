@@ -268,13 +268,42 @@ func TestServiceOverrideFromFlags(t *testing.T) {
 }
 
 func TestRoleSessionName(t *testing.T) {
-	t.Setenv("AWS_ROLE_SESSION_NAME", "custom-session")
-	if got := roleSessionName(func() (string, error) { return "host", nil }); got != "custom-session" {
-		t.Errorf("roleSessionName = %q, want custom-session", got)
+	hostFn := func(name string) func() (string, error) {
+		return func() (string, error) { return name, nil }
 	}
+
+	t.Setenv("AWS_ROLE_SESSION_NAME", "custom-session")
+	if got, err := roleSessionName(hostFn("host")); err != nil || got != "custom-session" {
+		t.Errorf("roleSessionName = %q, %v; want custom-session", got, err)
+	}
+
+	// Values violating the STS constraint are rejected, not silently rewritten.
+	for _, invalid := range []string{"has space", "x", strings.Repeat("a", 65), "日本語"} {
+		t.Setenv("AWS_ROLE_SESSION_NAME", invalid)
+		if got, err := roleSessionName(hostFn("host")); err == nil {
+			t.Errorf("roleSessionName(env=%q) = %q, want error", invalid, got)
+		}
+	}
+
 	t.Setenv("AWS_ROLE_SESSION_NAME", "")
-	if got := roleSessionName(func() (string, error) { return "myhost", nil }); got != "aws-sigv4-proxy-myhost" {
-		t.Errorf("roleSessionName = %q, want aws-sigv4-proxy-myhost", got)
+	if got, err := roleSessionName(hostFn("myhost")); err != nil || got != "awsigv4-proxy-myhost" {
+		t.Errorf("roleSessionName = %q, %v; want awsigv4-proxy-myhost", got, err)
+	}
+
+	// Hostname characters outside [\w+=,.@-] are sanitized to '-'.
+	if got, err := roleSessionName(hostFn("my host!")); err != nil || got != "awsigv4-proxy-my-host-" {
+		t.Errorf("roleSessionName = %q, %v; want awsigv4-proxy-my-host-", got, err)
+	}
+
+	// Long hostnames are truncated to the 64-character STS limit.
+	got, err := roleSessionName(hostFn(strings.Repeat("h", 100)))
+	if err != nil || len(got) != 64 || !strings.HasPrefix(got, "awsigv4-proxy-hhh") {
+		t.Errorf("roleSessionName = %q (len %d), %v; want 64-char truncation", got, len(got), err)
+	}
+
+	// A multi-byte hostname must not leave invalid bytes or split a rune.
+	if got, err := roleSessionName(hostFn("ホスト")); err != nil || got != "awsigv4-proxy----" {
+		t.Errorf("roleSessionName = %q, %v; want awsigv4-proxy----", got, err)
 	}
 }
 

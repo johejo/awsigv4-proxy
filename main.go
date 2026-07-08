@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -150,9 +151,13 @@ func run(ctx context.Context, o *options, logger *slog.Logger) error {
 
 	creds := cfg.Credentials
 	if o.roleArn != "" {
+		sessionName, err := roleSessionName(os.Hostname)
+		if err != nil {
+			return err
+		}
 		stsClient := sts.NewFromConfig(cfg)
 		provider := stscreds.NewAssumeRoleProvider(stsClient, o.roleArn, func(p *stscreds.AssumeRoleOptions) {
-			p.RoleSessionName = roleSessionName(os.Hostname)
+			p.RoleSessionName = sessionName
 		})
 		creds = aws.NewCredentialsCache(provider)
 	}
@@ -306,19 +311,35 @@ func validateHeaderNames(flagName string, names []string) error {
 	return nil
 }
 
-// roleSessionName mirrors the original aws-sigv4-proxy behavior.
-func roleSessionName(hostnameFn func() (string, error)) string {
+// roleSessionNamePattern is the STS AssumeRole RoleSessionName constraint.
+var roleSessionNamePattern = regexp.MustCompile(`^[\w+=,.@-]{2,64}$`)
+
+// roleSessionName derives the AssumeRole session name. An explicit
+// AWS_ROLE_SESSION_NAME is rejected if invalid (rewriting it would hide the
+// misconfiguration); the hostname-derived default is sanitized instead.
+func roleSessionName(hostnameFn func() (string, error)) (string, error) {
 	if env := os.Getenv("AWS_ROLE_SESSION_NAME"); env != "" {
-		return env
+		if !roleSessionNamePattern.MatchString(env) {
+			return "", fmt.Errorf("AWS_ROLE_SESSION_NAME %q must match %s", env, roleSessionNamePattern)
+		}
+		return env, nil
 	}
-	name := "aws-sigv4-proxy-"
+	name := "awsigv4-proxy-"
 	if hostname, err := hostnameFn(); err == nil {
 		name += hostname
 	} else {
 		name += strconv.FormatInt(time.Now().Unix(), 10)
 	}
+	name = strings.Map(func(r rune) rune {
+		switch {
+		case r >= '0' && r <= '9', r >= 'A' && r <= 'Z', r >= 'a' && r <= 'z',
+			r == '_', r == '+', r == '=', r == ',', r == '.', r == '@', r == '-':
+			return r
+		}
+		return '-'
+	}, name)
 	if len(name) > 64 {
-		return name[:64]
+		name = name[:64]
 	}
-	return name
+	return name, nil
 }
