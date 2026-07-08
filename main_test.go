@@ -439,17 +439,41 @@ func TestProxyClientDuplicateHeadersAfterStrip(t *testing.T) {
 }
 
 func TestPayloadHash(t *testing.T) {
-	stub := &stubClient{}
-	p := staticProxy(stub)
-	req := httptest.NewRequest(http.MethodPost, "http://sts.us-east-1.amazonaws.com/", strings.NewReader("hello"))
-	if _, err := p.Do(req); err != nil {
-		t.Fatalf("Do: %v", err)
+	tests := []struct {
+		name     string
+		method   string
+		body     io.Reader
+		wantHash string
+	}{
+		{
+			name:     "POST body",
+			method:   http.MethodPost,
+			body:     strings.NewReader("hello"),
+			wantHash: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+		},
+		{
+			name:     "GET empty body",
+			method:   http.MethodGet,
+			body:     nil,
+			wantHash: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+		},
 	}
-	// Known-answer SHA-256 of "hello" rather than a recomputation, so the test
-	// shares no hashing code with the implementation.
-	const wantHash = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
-	if got := stub.got.Header.Get("X-Amz-Content-Sha256"); got != wantHash {
-		t.Errorf("X-Amz-Content-Sha256 = %q, want %q", got, wantHash)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stub := &stubClient{}
+			p := staticProxy(stub)
+			req := httptest.NewRequest(tt.method, "http://sts.us-east-1.amazonaws.com/", tt.body)
+			if _, err := p.Do(req); err != nil {
+				t.Fatalf("Do: %v", err)
+			}
+			// Known-answer SHA-256 values rather than recomputations, so the
+			// test shares no hashing code with the implementation. The empty
+			// GET case is the common SigV4 path and must not become
+			// UNSIGNED-PAYLOAD.
+			if got := stub.got.Header.Get("X-Amz-Content-Sha256"); got != tt.wantHash {
+				t.Errorf("X-Amz-Content-Sha256 = %q, want %q", got, tt.wantHash)
+			}
+		})
 	}
 }
 
