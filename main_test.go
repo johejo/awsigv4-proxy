@@ -944,6 +944,27 @@ func TestBodyReadErrorIsClientError(t *testing.T) {
 	}
 }
 
+func TestIsEventStream(t *testing.T) {
+	tests := []struct {
+		contentType string
+		want        bool
+	}{
+		{contentType: "text/event-stream", want: true},
+		{contentType: "text/event-stream; charset=utf-8", want: true},
+		{contentType: "TEXT/EVENT-STREAM", want: true},
+		{contentType: "text/event-streamx", want: false},
+		{contentType: "application/json", want: false},
+		{contentType: "", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.contentType, func(t *testing.T) {
+			if got := isEventStream(tt.contentType); got != tt.want {
+				t.Errorf("isEventStream(%q) = %v, want %v", tt.contentType, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestStreamingResponseFlushes(t *testing.T) {
 	tests := []struct {
 		name          string
