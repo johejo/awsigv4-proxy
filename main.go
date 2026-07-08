@@ -72,7 +72,7 @@ func parseFlags(fs *flag.FlagSet, args []string) (*options, error) {
 	fs.StringVar(&o.port, "port", ":8080", "TCP network address (port and optional ip/hostname) for HTTP server to listen on. E.g., :8080, 127.0.0.1:8080, or example.com:80")
 	fs.Var(&o.strip, "strip", "Headers to strip from incoming request")
 	fs.Var(&o.strip, "s", "Headers to strip from incoming request (shorthand)")
-	fs.StringVar(&o.customHeaders, "custom-headers", "", "Comma-separated list of custom headers in key=value format")
+	fs.StringVar(&o.customHeaders, "custom-headers", "", "Comma-separated list of custom headers in key=value format (values cannot contain commas)")
 	fs.Var(&o.duplicateHeaders, "duplicate-headers", "Duplicate headers to an X-Original- prefix name")
 	fs.StringVar(&o.roleArn, "role-arn", "", "Amazon Resource Name (ARN) of the role to assume")
 	fs.StringVar(&o.name, "name", "", "AWS Service to sign for")
@@ -129,7 +129,19 @@ func main() {
 }
 
 func run(ctx context.Context, o *options, logger *slog.Logger) error {
-	customHeaders := parseCustomHeaders(o.customHeaders, logger)
+	customHeaders, err := parseCustomHeaders(o.customHeaders)
+	if err != nil {
+		return err
+	}
+	// Header.Del/Values with a non-token name silently matches nothing, so a
+	// typo in these flags would otherwise leave a header unstripped (or never
+	// duplicated) with no indication. Fail at startup like --custom-headers.
+	if err := validateHeaderNames("strip", o.strip); err != nil {
+		return err
+	}
+	if err := validateHeaderNames("duplicate-headers", o.duplicateHeaders); err != nil {
+		return err
+	}
 
 	cfg, err := loadAWSConfig(ctx, o)
 	if err != nil {
@@ -257,20 +269,41 @@ func loadAWSConfig(ctx context.Context, o *options) (aws.Config, error) {
 }
 
 // parseCustomHeaders parses a comma-separated list of key=value pairs.
-func parseCustomHeaders(s string, logger *slog.Logger) http.Header {
+// Malformed pairs and invalid header names/values are rejected here so a bad
+// flag fails at startup; http.Transport would otherwise reject them on every
+// proxied request. Values cannot contain commas (there is no escaping).
+func parseCustomHeaders(s string) (http.Header, error) {
 	h := make(http.Header)
-	if s == "" {
-		return h
-	}
 	for pair := range strings.SplitSeq(s, ",") {
+		pair = strings.TrimSpace(pair)
+		if pair == "" {
+			continue
+		}
 		k, v, ok := strings.Cut(pair, "=")
 		if !ok {
-			logger.Warn("invalid header format, skipping", "header", pair)
-			continue
+			return nil, fmt.Errorf("invalid custom header %q: want key=value", pair)
+		}
+		k, v = strings.TrimSpace(k), strings.TrimSpace(v)
+		if !ValidHeaderFieldName(k) {
+			return nil, fmt.Errorf("invalid custom header name %q", k)
+		}
+		if !ValidHeaderFieldValue(v) {
+			return nil, fmt.Errorf("invalid custom header value %q for %q", v, k)
 		}
 		h.Add(k, v)
 	}
-	return h
+	return h, nil
+}
+
+// validateHeaderNames checks every name in a header-name flag against the
+// RFC 7230 token rule.
+func validateHeaderNames(flagName string, names []string) error {
+	for _, name := range names {
+		if !ValidHeaderFieldName(name) {
+			return fmt.Errorf("invalid header name %q in --%s", name, flagName)
+		}
+	}
+	return nil
 }
 
 // roleSessionName mirrors the original aws-sigv4-proxy behavior.

@@ -174,21 +174,54 @@ func FuzzDetermineAWSServiceFromHost(f *testing.F) {
 }
 
 func TestParseCustomHeaders(t *testing.T) {
-	h := parseCustomHeaders("X-Foo=bar,X-Baz=qux,malformed,X-Empty=", discardLogger())
+	// Trailing comma and blank segments are ignored, not errors.
+	h, err := parseCustomHeaders("X-Foo=bar, X-Baz=qux , ,X-Empty=,X-Eq=a=b,")
+	if err != nil {
+		t.Fatalf("parseCustomHeaders: %v", err)
+	}
+	if len(h) != 4 {
+		t.Errorf("got %d headers, want 4: %v", len(h), h)
+	}
 	if got := h.Get("X-Foo"); got != "bar" {
 		t.Errorf("X-Foo = %q, want bar", got)
 	}
 	if got := h.Get("X-Baz"); got != "qux" {
-		t.Errorf("X-Baz = %q, want qux", got)
-	}
-	if _, ok := h["Malformed"]; ok {
-		t.Errorf("malformed entry should be skipped, got %v", h)
+		t.Errorf("X-Baz = %q, want qux (whitespace should be trimmed)", got)
 	}
 	if got := h.Get("X-Empty"); got != "" {
 		t.Errorf("X-Empty = %q, want empty", got)
 	}
-	if len(parseCustomHeaders("", discardLogger())) != 0 {
-		t.Errorf("empty input should yield no headers")
+	if got := h.Get("X-Eq"); got != "a=b" {
+		t.Errorf("X-Eq = %q, want a=b (split on first = only)", got)
+	}
+
+	if h, err := parseCustomHeaders(""); err != nil || len(h) != 0 {
+		t.Errorf("parseCustomHeaders(\"\") = %v, %v; want no headers, nil error", h, err)
+	}
+
+	for _, in := range []string{
+		"malformed",         // no =
+		"=bar",              // empty name
+		"X Foo=bar",         // space in name
+		"X-Foo:extra=bar",   // invalid token char
+		"X-Foo=b\x00ar",     // control char in value
+		"X-Foo=bar,between", // valid pair followed by malformed one
+	} {
+		if _, err := parseCustomHeaders(in); err == nil {
+			t.Errorf("parseCustomHeaders(%q) = nil error, want error", in)
+		}
+	}
+}
+
+func TestValidateHeaderNames(t *testing.T) {
+	if err := validateHeaderNames("strip", []string{"Authorization", "X-Trace"}); err != nil {
+		t.Errorf("valid names: %v", err)
+	}
+	if err := validateHeaderNames("strip", []string{"X Trace"}); err == nil {
+		t.Errorf("name with space: want error")
+	}
+	if err := validateHeaderNames("duplicate-headers", []string{""}); err == nil {
+		t.Errorf("empty name: want error")
 	}
 }
 
