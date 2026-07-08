@@ -923,6 +923,9 @@ func TestParseFlagsRejectsLeftoverArgs(t *testing.T) {
 	if !o.verbose || len(o.strip) != 1 || o.strip[0] != "X" {
 		t.Errorf("options = %+v, want verbose + strip [X]", o)
 	}
+	if o.maxRequestBodySize != defaultMaxRequestBodySize {
+		t.Errorf("maxRequestBodySize = %d, want default %d", o.maxRequestBodySize, defaultMaxRequestBodySize)
+	}
 }
 
 func TestProxyHandlerCopiesResponse(t *testing.T) {
