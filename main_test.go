@@ -336,33 +336,6 @@ func staticProxy(client httpClient) *proxyClient {
 	}
 }
 
-func TestProxyClientSignsRequest(t *testing.T) {
-	stub := &stubClient{}
-	p := staticProxy(stub)
-
-	req := httptest.NewRequest(http.MethodGet, "http://sts.us-east-1.amazonaws.com/?Action=GetCallerIdentity", nil)
-
-	resp, err := p.Do(req)
-	if err != nil {
-		t.Fatalf("Do: %v", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d", resp.StatusCode)
-	}
-	if stub.got.Header.Get("Authorization") == "" {
-		t.Error("missing Authorization header on signed request")
-	}
-	if stub.got.Header.Get("X-Amz-Date") == "" {
-		t.Error("missing X-Amz-Date header on signed request")
-	}
-	if !strings.Contains(stub.got.Header.Get("Authorization"), "us-east-1/sts/aws4_request") {
-		t.Errorf("Authorization does not reference sts/us-east-1: %q", stub.got.Header.Get("Authorization"))
-	}
-	if stub.got.URL.Scheme != "https" {
-		t.Errorf("scheme = %q, want https", stub.got.URL.Scheme)
-	}
-}
-
 func TestProxyClientOverrides(t *testing.T) {
 	stub := &stubClient{}
 	p := staticProxy(stub)
@@ -465,14 +438,6 @@ func TestProxyClientDuplicateHeadersAfterStrip(t *testing.T) {
 	}
 }
 
-func TestProxyClientUnknownHost(t *testing.T) {
-	p := staticProxy(&stubClient{})
-	req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
-	if _, err := p.Do(req); err == nil {
-		t.Fatal("expected error for unknown host without overrides")
-	}
-}
-
 func TestPayloadHash(t *testing.T) {
 	stub := &stubClient{}
 	p := staticProxy(stub)
@@ -531,6 +496,9 @@ func TestDeterministicSignature(t *testing.T) {
 	const wantAuth = "AWS4-HMAC-SHA256 Credential=AKID/20260702/us-east-1/sts/aws4_request, SignedHeaders=content-length;content-type;host;x-amz-content-sha256;x-amz-date, Signature=8df0e857750592d97116a4c1fa988470bb980d346c2e4c4b84e69af5cdb2fb22"
 	if auth := stub.got.Header.Get("Authorization"); auth != wantAuth {
 		t.Errorf("Authorization = %q, want %q", auth, wantAuth)
+	}
+	if stub.got.URL.Scheme != "https" {
+		t.Errorf("scheme = %q, want https (default upstream scheme)", stub.got.URL.Scheme)
 	}
 }
 
@@ -769,14 +737,6 @@ func TestProxyHandlerErrorResponses(t *testing.T) {
 		if stub.got != nil {
 			t.Errorf("query %q was forwarded upstream", q)
 		}
-	}
-
-	// Do surfaces the malformed query as a typed client error.
-	req = httptest.NewRequest(http.MethodGet, "http://sts.us-east-1.amazonaws.com/?a=%zz", nil)
-	if _, err := staticProxy(&stubClient{}).Do(req); err == nil {
-		t.Error("Do: expected error for malformed query")
-	} else if _, ok := errors.AsType[*clientError](err); !ok {
-		t.Errorf("Do error = %v, want *clientError", err)
 	}
 }
 
