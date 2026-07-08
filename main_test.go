@@ -81,6 +81,27 @@ func TestDetermineAWSServiceFromHost(t *testing.T) {
 		{host: "us-east-2.queue.amazonaws.com", wantName: "sqs", wantRegion: "us-east-2"},
 		{host: "sts.cn-north-1.amazonaws.com.cn", wantName: "sts", wantRegion: "cn-north-1"},
 		{host: "sts.us-east-1.amazonaws.com:443", wantName: "sts", wantRegion: "us-east-1"},
+		// Signing names that differ from the endpoint label, generated from
+		// botocore service metadata.
+		{host: "bedrock-runtime.us-east-1.amazonaws.com", wantName: "bedrock", wantRegion: "us-east-1"},
+		{host: "pinpoint.us-east-1.amazonaws.com", wantName: "mobiletargeting", wantRegion: "us-east-1"},
+		{host: "runtime-v2-lex.us-east-1.amazonaws.com", wantName: "lex", wantRegion: "us-east-1"},
+		// Dotted service prefixes whose signing name differs from their last
+		// label.
+		{host: "participant.connect.us-east-1.amazonaws.com", wantName: "execute-api", wantRegion: "us-east-1"},
+		{host: "portal.sso.us-east-1.amazonaws.com", wantName: "awsssoportal", wantRegion: "us-east-1"},
+		// Dualstack endpoints under api.aws, including a -fips + alias combo.
+		{host: "dynamodb.us-east-1.api.aws", wantName: "dynamodb", wantRegion: "us-east-1"},
+		{host: "bedrock-runtime-fips.us-east-1.api.aws", wantName: "bedrock", wantRegion: "us-east-1"},
+		// Non-S3 VPC interface endpoints, plain and with a dotted prefix.
+		{host: "vpce-0a1b2c3d4e5f.execute-api.us-east-1.vpce.amazonaws.com", wantName: "execute-api", wantRegion: "us-east-1"},
+		{host: "vpce-0a1b2c3d4e5f.api.ecr.us-west-2.vpce.amazonaws.com", wantName: "ecr", wantRegion: "us-west-2"},
+		// Global endpoints are partition-aware (the cn and us-gov variants
+		// must not sign against the aws-partition region)...
+		{host: "route53.amazonaws.com.cn", wantName: "route53", wantRegion: "cn-northwest-1"},
+		{host: "iam.us-gov.amazonaws.com", wantName: "iam", wantRegion: "us-gov-west-1"},
+		// ...and match the exact host only: junk prefixes must not sign.
+		{host: "foo.iam.amazonaws.com", wantNil: true},
 		// Garbage labels must not become signing names.
 		{host: "my_svc!.us-east-1.amazonaws.com", wantNil: true},
 		{host: ".us-east-1.amazonaws.com", wantNil: true},
@@ -106,6 +127,57 @@ func TestDetermineAWSServiceFromHost(t *testing.T) {
 					tt.host, got.signingName, got.signingRegion, tt.wantName, tt.wantRegion)
 			}
 		})
+	}
+}
+
+// TestGeneratedTablesConsistentWithHandRules pins the boundary between the
+// hand-written tables in proxy.go and the generated ones in services_gen.go:
+// an entry appearing on both sides means one of them must be removed, and
+// generated entries must satisfy the invariants the matchers rely on.
+func TestGeneratedTablesConsistentWithHandRules(t *testing.T) {
+	for k := range serviceAliases {
+		if v, ok := generatedServiceAliases[k]; ok {
+			t.Errorf("hand-written alias %q is now generated (-> %q); remove the hand entry", k, v)
+		}
+	}
+	for k := range s3Labels {
+		if _, ok := generatedServiceAliases[k]; ok {
+			t.Errorf("s3 label %q must not appear in generatedServiceAliases", k)
+		}
+	}
+	for k := range legacyGlobalEndpoints {
+		if _, ok := generatedGlobalEndpoints["amazonaws.com"][k]; ok {
+			t.Errorf("legacy global endpoint %q is now generated; remove the hand entry", k)
+		}
+	}
+	for k, v := range generatedServiceAliases {
+		if strings.Contains(k, ".") {
+			t.Errorf("generated alias key %q must be a single label", k)
+		}
+		if !signingNameRe.MatchString(v) {
+			t.Errorf("generated alias %q has implausible signing name %q", k, v)
+		}
+	}
+	for k, v := range generatedDottedAliases {
+		if strings.HasSuffix(k, ".iot") {
+			t.Errorf("dotted alias %q under iot belongs to the hand-written iot rules", k)
+		}
+		if n := strings.Count(k, ".") + 1; n < 2 || n > 3 {
+			t.Errorf("dotted alias %q has %d labels; serviceName probes 2 to 3", k, n)
+		}
+		if !signingNameRe.MatchString(v) {
+			t.Errorf("dotted alias %q has implausible signing name %q", k, v)
+		}
+	}
+	for suffix, endpoints := range generatedGlobalEndpoints {
+		if _, ok := generatedPartitionSuffixes[suffix]; !ok {
+			t.Errorf("global endpoints under unknown partition suffix %q", suffix)
+		}
+		for k, svc := range endpoints {
+			if !signingNameRe.MatchString(svc.signingName) || !isRegionAny(svc.signingRegion) {
+				t.Errorf("global endpoint %s.%s has implausible signing info %s/%s", k, suffix, svc.signingName, svc.signingRegion)
+			}
+		}
 	}
 }
 
@@ -138,13 +210,20 @@ func FuzzDetermineAWSServiceFromHost(f *testing.F) {
 	f.Add("a1b2c3d4e5-ats.iot.us-east-1.amazonaws.com")
 	f.Add("abc123.us-east-1.aoss.amazonaws.com")
 	f.Add("queue.amazonaws.com")
+	f.Add("bedrock-runtime.us-east-1.amazonaws.com")
+	f.Add("participant.connect.us-east-1.amazonaws.com")
+	f.Add("dynamodb.us-east-1.api.aws")
+	f.Add("vpce-0a1b2c3d4e5f.api.ecr.us-west-2.vpce.amazonaws.com")
+	f.Add("iam.us-gov.amazonaws.com")
+	f.Add("route53.amazonaws.com.cn")
 	f.Add("my_svc!.us-east-1.amazonaws.com")
 	f.Add("")
 	f.Fuzz(func(t *testing.T, host string) {
 		svc := determineAWSServiceFromHost(host)
-		// isRegion is reused because no matcher validates the region centrally;
-		// a future matcher deriving an unvalidated region is still caught.
-		if svc != nil && (svc.signingName == "" || !isRegion(svc.signingRegion)) {
+		// isRegionAny is reused because no matcher validates the region
+		// centrally; a future matcher deriving an unvalidated region is still
+		// caught.
+		if svc != nil && (svc.signingName == "" || !isRegionAny(svc.signingRegion)) {
 			t.Fatalf("invalid service for %q: %+v", host, svc)
 		}
 		// Normalization invariance: a default port, trailing dot or different

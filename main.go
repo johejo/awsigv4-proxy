@@ -7,6 +7,10 @@
 // library as much as possible. It aims to accept the same command line options.
 package main
 
+// services_gen.go (signing-name aliases, partition suffixes and global
+// endpoints) is generated from botocore's service definitions:
+//go:generate go run ./tools/gen-services
+
 import (
 	"context"
 	"crypto/tls"

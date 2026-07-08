@@ -6,6 +6,11 @@ Motivation
   - Use aws-sdk-go-v2, default AWS_SDK_LOAD_CONFIG=1, regional sts endpoint support
   - Less third-party dependencies, use stdlib as much as possible.
 
+Development
+  - Host-to-signing-service data (services_gen.go) is generated from
+    botocore's service definitions. To refresh it, bump defaultRef in
+    tools/gen-services/main.go and run: go generate ./...
+
 Compatibility
   - Support same command line options as aws-sigv4-proxy.
   - Known difference: kingpin-specific flag syntax is not supported —

@@ -463,11 +463,16 @@ func (s *awsService) disableURIPathEscaping() bool {
 	return s.signingName == "s3" || s.signingName == "s3-object-lambda"
 }
 
-// regionRe loosely matches AWS region tokens such as us-east-1, ap-southeast-2
-// and us-gov-west-1.
-var regionRe = regexp.MustCompile(`^[a-z]{2}(-[a-z]+)+-\d+$`)
-
-func isRegion(s string) bool { return regionRe.MatchString(s) }
+// isRegionAny reports whether s matches any partition's region pattern; used
+// where no partition context exists (on.aws hosts).
+func isRegionAny(s string) bool {
+	for _, re := range generatedPartitionSuffixes {
+		if re.MatchString(s) {
+			return true
+		}
+	}
+	return false
+}
 
 // hostMatcher derives signing info from normalized (lowercased, port- and
 // trailing-dot-stripped) host labels, returning nil when its pattern does not
@@ -477,7 +482,7 @@ type hostMatcher func(labels []string) *awsService
 // hostMatchers handle disjoint domain families; the first match wins.
 var hostMatchers = []hostMatcher{
 	matchOnAws,
-	matchAmazonAws,
+	matchPartitionHost,
 }
 
 // signingNameRe matches plausible SigV4 signing names; anything else derived
@@ -524,32 +529,49 @@ func matchOnAws(labels []string) *awsService {
 		return nil
 	}
 	name, ok := onAwsServices[labels[n-4]]
-	if !ok || !isRegion(labels[n-3]) {
+	if !ok || !isRegionAny(labels[n-3]) {
 		return nil
 	}
 	return &awsService{signingName: name, signingRegion: labels[n-3]}
 }
 
-// matchAmazonAws handles hosts under amazonaws.com or amazonaws.com.cn.
-func matchAmazonAws(labels []string) *awsService {
-	rest, ok := amazonAWSRest(labels)
-	if !ok || len(rest) == 0 {
+// matchPartitionHost handles hosts under a partition DNS suffix
+// (amazonaws.com, amazonaws.com.cn, api.aws, ...).
+func matchPartitionHost(labels []string) *awsService {
+	rest, ps := partitionRest(labels)
+	if ps == nil || len(rest) == 0 {
 		return nil
+	}
+
+	// VPC interface endpoints insert a "vpce" label before the suffix
+	// (vpce-<id>.<service>.<region>.vpce.amazonaws.com); drop it and match
+	// the remainder like the plain endpoint host.
+	if rest[len(rest)-1] == "vpce" {
+		rest = rest[:len(rest)-1]
+		if len(rest) == 0 {
+			return nil
+		}
 	}
 
 	// S3 determines its region positionally (a dotted bucket name may contain
 	// region-shaped labels), so it must run before the findRegion-based rules.
-	if svc := matchS3(rest); svc != nil {
+	if svc := matchS3(rest, ps.regionRe); svc != nil {
 		return svc
 	}
 
-	region := findRegion(rest)
+	region := findRegion(rest, ps.regionRe)
 	if region == "" {
 		// Region-less global endpoints (e.g. iam.amazonaws.com,
-		// sts.amazonaws.com) sign against a fixed region.
-		svc := normalizeService(rest[len(rest)-1])
-		if r, ok := globalServices[svc]; ok {
-			return &awsService{signingName: svc, signingRegion: r}
+		// sts.amazonaws.com) sign against a fixed region. Exact host match
+		// only: a prefixed host under a global endpoint is not a known shape.
+		key := strings.Join(rest, ".")
+		if svc, ok := generatedGlobalEndpoints[ps.suffix][key]; ok {
+			return &svc
+		}
+		if ps.suffix == "amazonaws.com" {
+			if svc, ok := legacyGlobalEndpoints[key]; ok {
+				return &svc
+			}
 		}
 		return nil
 	}
@@ -560,12 +582,12 @@ func matchAmazonAws(labels []string) *awsService {
 		return &awsService{signingName: name, signingRegion: region}
 	}
 
-	// Generic: [...].<service>.<region>.amazonaws.com — region is the last
-	// label and the service is the label immediately before it.
+	// Generic: [...].<service>.<region>.<suffix> — region is the last label
+	// and the service is the label (or dotted labels) immediately before it.
 	if len(rest) < 2 || rest[len(rest)-1] != region {
 		return nil
 	}
-	name := normalizeService(rest[len(rest)-2])
+	name := serviceName(rest[:len(rest)-1])
 	// IoT hosts with labels before "iot" are data planes with their own
 	// signing names; only match the documented shapes and refuse to guess for
 	// the rest (e.g. <prefix>.credentials.iot.<region>, which does not use
@@ -585,20 +607,36 @@ func matchAmazonAws(labels []string) *awsService {
 	return &awsService{signingName: name, signingRegion: region}
 }
 
+// serviceName resolves the signing name from the labels before the region:
+// dotted service prefixes first (participant.connect.<region> signs
+// execute-api), then the single-label path via normalizeService. The probe
+// depth matches the generator's maxDottedLabels; iot data planes are absent
+// from the dotted table by construction and fall through to the single-label
+// path, keeping the iot special case in matchPartitionHost authoritative.
+func serviceName(prefix []string) string {
+	for n := min(3, len(prefix)); n >= 2; n-- {
+		key := strings.TrimSuffix(strings.Join(prefix[len(prefix)-n:], "."), "-fips")
+		if alias, ok := generatedDottedAliases[key]; ok {
+			return alias
+		}
+	}
+	return normalizeService(prefix[len(prefix)-1])
+}
+
 // matchS3 handles the S3 endpoint family (s3Labels plus the legacy dashed form
 // s3-<region>). Labels before the right-most s3-family label belong to the
 // bucket or access-point name, which may itself be dotted or region-shaped, so
 // the region is searched only in the suffix after it. No suffix at all is the
 // legacy global endpoint (us-east-1); a suffix without a region is not a known
 // S3 form and must not sign as global S3.
-func matchS3(rest []string) *awsService {
+func matchS3(rest []string, regionRe *regexp.Regexp) *awsService {
 	for i := len(rest) - 1; i >= 0; i-- {
 		name, ok := s3Labels[rest[i]]
 		if !ok {
 			// Legacy dashed form, where the label carries its own region:
-			// s3-<region>. The s3- prefix keeps it from matching regionRe
-			// or s3Labels.
-			if r := strings.TrimPrefix(rest[i], "s3-"); r != rest[i] && isRegion(r) {
+			// s3-<region>. The s3- prefix keeps it from matching the region
+			// pattern or s3Labels.
+			if r := strings.TrimPrefix(rest[i], "s3-"); r != rest[i] && regionRe.MatchString(r) {
 				return &awsService{signingName: "s3", signingRegion: r}
 			}
 			continue
@@ -607,7 +645,7 @@ func matchS3(rest []string) *awsService {
 		if len(suffix) == 0 {
 			return &awsService{signingName: name, signingRegion: "us-east-1"}
 		}
-		if r := findRegion(suffix); r != "" {
+		if r := findRegion(suffix, regionRe); r != "" {
 			return &awsService{signingName: name, signingRegion: r}
 		}
 		return nil
@@ -615,17 +653,42 @@ func matchS3(rest []string) *awsService {
 	return nil
 }
 
-// amazonAWSRest strips the amazonaws.com / amazonaws.com.cn suffix, returning
-// the remaining labels and whether the host is under either domain.
-func amazonAWSRest(labels []string) ([]string, bool) {
-	n := len(labels)
-	switch {
-	case n >= 4 && labels[n-3] == "amazonaws" && labels[n-2] == "com" && labels[n-1] == "cn":
-		return labels[:n-3], true
-	case n >= 3 && labels[n-2] == "amazonaws" && labels[n-1] == "com":
-		return labels[:n-2], true
+// partitionSuffix pairs a partition DNS suffix (as labels, for label-wise
+// matching) with the pattern for its region labels.
+type partitionSuffix struct {
+	suffix   string
+	labels   []string
+	regionRe *regexp.Regexp
+}
+
+// partitionSuffixes is generatedPartitionSuffixes prepared for matching,
+// longest suffix first so amazonaws.com.cn wins over any shorter overlap.
+var partitionSuffixes = func() []partitionSuffix {
+	ps := make([]partitionSuffix, 0, len(generatedPartitionSuffixes))
+	for s, re := range generatedPartitionSuffixes {
+		ps = append(ps, partitionSuffix{suffix: s, labels: strings.Split(s, "."), regionRe: re})
 	}
-	return nil, false
+	slices.SortFunc(ps, func(a, b partitionSuffix) int {
+		if d := len(b.labels) - len(a.labels); d != 0 {
+			return d
+		}
+		return strings.Compare(a.suffix, b.suffix)
+	})
+	return ps
+}()
+
+// partitionRest strips a known partition DNS suffix, returning the remaining
+// labels and the matched suffix (nil when the host is under no partition).
+func partitionRest(labels []string) ([]string, *partitionSuffix) {
+	for i := range partitionSuffixes {
+		p := &partitionSuffixes[i]
+		n := len(labels) - len(p.labels)
+		if n < 1 || !slices.Equal(labels[n:], p.labels) {
+			continue
+		}
+		return labels[:n], p
+	}
+	return nil, nil
 }
 
 // s3Labels maps S3-family endpoint host labels to their SigV4 signing names.
@@ -639,18 +702,12 @@ var s3Labels = map[string]string{
 	"s3-outposts":         "s3-outposts",
 }
 
-// globalServices are region-less AWS endpoints, keyed by normalized service
-// label (which is also the SigV4 signing name), with the fixed region they
-// sign against.
-var globalServices = map[string]string{
-	"iam":               "us-east-1",
-	"sts":               "us-east-1",
-	"cloudfront":        "us-east-1",
-	"route53":           "us-east-1",
-	"waf":               "us-east-1",
-	"organizations":     "us-east-1",
-	"globalaccelerator": "us-west-2",
-	"sqs":               "us-east-1", // legacy queue.amazonaws.com, via the queue alias
+// legacyGlobalEndpoints are region-less amazonaws.com endpoints that predate
+// endpoints.json (the source of generatedGlobalEndpoints) and so cannot be
+// generated.
+var legacyGlobalEndpoints = map[string]awsService{
+	"queue":             {signingName: "sqs", signingRegion: "us-east-1"}, // legacy global SQS
+	"globalaccelerator": {signingName: "globalaccelerator", signingRegion: "us-west-2"},
 }
 
 // lastLabelServices maps services whose endpoint hosts end in the service
@@ -664,15 +721,13 @@ var lastLabelServices = map[string]string{
 }
 
 // serviceAliases maps endpoint host labels whose SigV4 signing name differs
-// from the label itself (per botocore's service metadata).
+// from the label itself and which are absent from botocore's service metadata
+// (generatedServiceAliases covers everything present there): these labels are
+// resource-specific host shapes with no service model of their own.
 var serviceAliases = map[string]string{
-	"aps-workspaces":      "aps",
-	"email":               "ses",
-	"appstream2":          "appstream",
-	"transcribestreaming": "transcribe",
-	"appsync-api":         "appsync", // <api-id>.appsync-api.<region>
-	"s3-control":          "s3",
-	"queue":               "sqs", // legacy global SQS: queue.amazonaws.com
+	"aps-workspaces":      "aps",        // <workspace>.aps-workspaces.<region>
+	"appsync-api":         "appsync",    // <api-id>.appsync-api.<region>
+	"transcribestreaming": "transcribe", // streaming data plane of transcribe
 }
 
 // normalizeService maps an endpoint's service label to its SigV4 signing name,
@@ -682,15 +737,19 @@ func normalizeService(s string) string {
 	if alias, ok := serviceAliases[s]; ok {
 		return alias
 	}
+	if alias, ok := generatedServiceAliases[s]; ok {
+		return alias
+	}
 	return s
 }
 
-// findRegion returns the last region-looking label, or "" if none. Scanning
-// from the right avoids treating a leading region-shaped label (such as an S3
-// bucket named like a region) as the endpoint's region.
-func findRegion(labels []string) string {
+// findRegion returns the last label matching the partition's region pattern,
+// or "" if none. Scanning from the right avoids treating a leading
+// region-shaped label (such as an S3 bucket named like a region) as the
+// endpoint's region.
+func findRegion(labels []string, regionRe *regexp.Regexp) string {
 	for i := len(labels) - 1; i >= 0; i-- {
-		if isRegion(labels[i]) {
+		if regionRe.MatchString(labels[i]) {
 			return labels[i]
 		}
 	}
