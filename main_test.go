@@ -925,7 +925,6 @@ func TestParseFlagsRejectsLeftoverArgs(t *testing.T) {
 	}
 }
 
-// Ensure the handler copies the upstream status/body/headers back to the caller.
 func TestProxyHandlerCopiesResponse(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Upstream", "hit")

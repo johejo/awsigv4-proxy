@@ -327,7 +327,6 @@ func (p *proxyClient) sign(ctx context.Context, req *http.Request, payloadHash s
 	return err
 }
 
-// debugDumpRequest logs a full request dump when debug logging is enabled.
 func (p *proxyClient) debugDumpRequest(ctx context.Context, msg string, req *http.Request, withBody bool) {
 	if !p.logger.Enabled(ctx, slog.LevelDebug) {
 		return
@@ -371,7 +370,6 @@ var presignedQueryParams = map[string]bool{
 	"x-amz-security-token": true,
 }
 
-// stripPresignedQueryParams removes presigned-URL auth parameters from q.
 func stripPresignedQueryParams(q url.Values) {
 	for k := range q {
 		if presignedQueryParams[strings.ToLower(k)] {
