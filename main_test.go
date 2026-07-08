@@ -451,17 +451,6 @@ func TestPayloadHash(t *testing.T) {
 	if got := stub.got.Header.Get("X-Amz-Content-Sha256"); got != wantHash {
 		t.Errorf("X-Amz-Content-Sha256 = %q, want %q", got, wantHash)
 	}
-
-	stub = &stubClient{}
-	p = staticProxy(stub)
-	p.unsignedPayload = true
-	req = httptest.NewRequest(http.MethodPost, "http://sts.us-east-1.amazonaws.com/", strings.NewReader("hello"))
-	if _, err := p.Do(req); err != nil {
-		t.Fatalf("Do: %v", err)
-	}
-	if got := stub.got.Header.Get("X-Amz-Content-Sha256"); got != "UNSIGNED-PAYLOAD" {
-		t.Errorf("X-Amz-Content-Sha256 = %q, want UNSIGNED-PAYLOAD", got)
-	}
 }
 
 // signedHeadersFromAuth extracts the SignedHeaders list from an Authorization
@@ -650,6 +639,9 @@ func TestUnsignedPayloadStreams(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPut, "http://mybucket.s3.us-west-2.amazonaws.com/key", strings.NewReader("hello"))
 	if _, err := p.Do(req); err != nil {
 		t.Fatalf("Do: %v", err)
+	}
+	if got := stub.got.Header.Get("X-Amz-Content-Sha256"); got != "UNSIGNED-PAYLOAD" {
+		t.Errorf("X-Amz-Content-Sha256 = %q, want UNSIGNED-PAYLOAD", got)
 	}
 	if stub.got.GetBody != nil {
 		t.Error("expected streaming body (GetBody == nil)")
