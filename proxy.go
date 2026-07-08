@@ -186,9 +186,11 @@ func (p *proxyClient) Do(req *http.Request) (*http.Response, error) {
 	// and which drops the signed Content-Length from the wire.
 	stream := p.unsignedPayload && req.ContentLength > 0
 
-	// Never dump the body on the streaming path: DumpRequest would drain the
-	// whole body into memory, defeating the point of streaming.
-	p.debugDumpRequest(ctx, "initial request dump", req, !stream)
+	// Never dump the body on the streaming path or for unknown-length bodies
+	// when a cap is configured: DumpRequest would drain the whole body into
+	// memory before the size limit below can be enforced.
+	dumpInitialBody := !stream && !(p.maxBodySize > 0 && req.ContentLength < 0)
+	p.debugDumpRequest(ctx, "initial request dump", req, dumpInitialBody)
 
 	var body []byte // buffered path only; stays nil when streaming
 	var bodyReader io.Reader

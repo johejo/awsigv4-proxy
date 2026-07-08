@@ -790,6 +790,20 @@ func TestMaxRequestBodySize(t *testing.T) {
 	req.ContentLength = -1
 	overLimit(t, p, req)
 
+	// Even with verbose/debug logging enabled, the initial dump must not read
+	// an unknown-length body before the cap is applied.
+	var logBuf bytes.Buffer
+	p = staticProxy(&stubClient{})
+	p.maxBodySize = 4
+	p.logger = slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	req = httptest.NewRequest(http.MethodPost, "http://sts.us-east-1.amazonaws.com/", strings.NewReader("hello"))
+	req.TransferEncoding = []string{"chunked"}
+	req.ContentLength = -1
+	overLimit(t, p, req)
+	if strings.Contains(logBuf.String(), "hello") {
+		t.Errorf("initial debug dump included over-limit chunked body: %q", logBuf.String())
+	}
+
 	// The streaming (unsigned payload) path has no buffered read, so the
 	// declared-length check must cover it.
 	p = staticProxy(&stubClient{})
