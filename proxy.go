@@ -232,10 +232,10 @@ func (p *proxyClient) Do(req *http.Request) (*http.Response, error) {
 
 	svc := p.serviceOverride
 	if svc == nil {
-		svc = determineAWSServiceFromHost(req.Host)
+		svc = p.determineSigningService(req.Host)
 	}
 	if svc == nil {
-		return nil, fmt.Errorf("unable to determine service from host: %q (set --name and --region)", req.Host)
+		return nil, fmt.Errorf("unable to determine service from host: %q (set --name and --region)", p.signingServiceHost(req.Host))
 	}
 
 	// Copy the caller's headers onto the proxy request, then drop hop-by-hop
@@ -303,6 +303,22 @@ func (p *proxyClient) Do(req *http.Request) (*http.Response, error) {
 	}
 
 	return resp, nil
+}
+
+func (p *proxyClient) signingServiceHost(requestHost string) string {
+	if p.signingHostOverride != "" {
+		return p.signingHostOverride
+	}
+	return requestHost
+}
+
+func (p *proxyClient) determineSigningService(requestHost string) *awsService {
+	if p.signingHostOverride != "" {
+		if svc := determineAWSServiceFromHost(p.signingHostOverride); svc != nil {
+			return svc
+		}
+	}
+	return determineAWSServiceFromHost(requestHost)
 }
 
 func (p *proxyClient) sign(ctx context.Context, req *http.Request, payloadHash string, svc *awsService) error {

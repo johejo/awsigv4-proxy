@@ -558,6 +558,43 @@ func TestSigningHostOverride(t *testing.T) {
 	}
 }
 
+func TestSigningHostOverrideDeterminesService(t *testing.T) {
+	tests := []struct {
+		name        string
+		signingHost string
+		requestURL  string
+		wantScope   string
+	}{
+		{
+			name:        "sign host",
+			signingHost: "sts.us-east-1.amazonaws.com",
+			requestURL:  "http://internal.example.com/",
+			wantScope:   "us-east-1/sts/aws4_request",
+		},
+		{
+			name:        "request host fallback",
+			signingHost: "signed.example.com",
+			requestURL:  "http://execute-api.us-west-2.amazonaws.com/",
+			wantScope:   "us-west-2/execute-api/aws4_request",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stub := &stubClient{}
+			p := staticProxy(stub)
+			p.signingHostOverride = tt.signingHost
+
+			req := httptest.NewRequest(http.MethodGet, tt.requestURL, nil)
+			if _, err := p.Do(req); err != nil {
+				t.Fatalf("Do: %v", err)
+			}
+			if auth := stub.got.Header.Get("Authorization"); !strings.Contains(auth, tt.wantScope) {
+				t.Errorf("Authorization does not reference %s: %q", tt.wantScope, auth)
+			}
+		})
+	}
+}
+
 // A chunked (unknown-length) inbound request must go upstream buffered, with
 // an exact Content-Length and no chunked transfer-encoding: the signer signs
 // content-length whenever ContentLength > 0, and chunked framing would omit
