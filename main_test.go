@@ -481,7 +481,8 @@ func TestDeterministicSignature(t *testing.T) {
 
 	// Golden value computed once from this fixed time, static credentials and
 	// request; asserting the exact header keeps the test independent of the
-	// proxy's own signing code, so a canonicalization bug cannot cancel out.
+	// runtime signing logic, so the test catches canonicalization bugs instead of
+	// reproducing them in the expected value.
 	const wantAuth = "AWS4-HMAC-SHA256 Credential=AKID/20260702/us-east-1/sts/aws4_request, SignedHeaders=content-length;content-type;host;x-amz-content-sha256;x-amz-date, Signature=8df0e857750592d97116a4c1fa988470bb980d346c2e4c4b84e69af5cdb2fb22"
 	if auth := stub.got.Header.Get("Authorization"); auth != wantAuth {
 		t.Errorf("Authorization = %q, want %q", auth, wantAuth)
