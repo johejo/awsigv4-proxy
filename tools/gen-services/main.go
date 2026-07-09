@@ -156,8 +156,8 @@ func download(ref string) (*input, error) {
 	in := &input{metas: make(map[string]serviceMeta)}
 	// Per service directory only the latest API version's model is used;
 	// versions are dates (YYYY-MM-DD), so they order lexically.
-	latest := make(map[string]string)             // service dir -> latest version seen
-	models := make(map[string]serviceMeta)        // service dir -> metadata of that version
+	latest := make(map[string]string)      // service dir -> latest version seen
+	models := make(map[string]serviceMeta) // service dir -> metadata of that version
 	modelRe := regexp.MustCompile(`^[^/]+/botocore/data/([^/]+)/([^/]+)/service-2\.json$`)
 	endpointsRe := regexp.MustCompile(`^[^/]+/botocore/data/endpoints\.json$`)
 
