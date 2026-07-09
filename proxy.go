@@ -144,6 +144,52 @@ type proxyClient struct {
 func (p *proxyClient) Do(req *http.Request) (*http.Response, error) {
 	ctx := req.Context()
 
+	b, err := p.buildProxyRequest(req)
+	if err != nil {
+		return nil, err
+	}
+	svc, err := p.resolveSigningService(req.Host)
+	if err != nil {
+		return nil, err
+	}
+	if err := p.sign(ctx, b.req, b.body, svc); err != nil {
+		return nil, err
+	}
+
+	p.debugDumpRequest(ctx, "proxying request", b.req, !b.stream)
+
+	resp, err := p.client.Do(b.req)
+	if err != nil {
+		return nil, err
+	}
+
+	if p.logFailedRequest && resp.StatusCode >= 400 {
+		// Log a bounded prefix of the error body without buffering the whole
+		// response, then splice it back so the caller still sees the full body.
+		const maxLogBody = 64 << 10
+		prefix, _ := io.ReadAll(io.LimitReader(resp.Body, maxLogBody))
+		p.logger.Error("error proxying request",
+			"request", fmt.Sprintf("%s %s", b.req.Method, b.req.URL),
+			"status_code", resp.StatusCode,
+			"message", string(prefix))
+		resp.Body = spliceBody(prefix, resp.Body)
+	}
+
+	return resp, nil
+}
+
+// builtRequest is the outbound request plus what Do and sign still need.
+type builtRequest struct {
+	req    *http.Request
+	body   []byte // buffered path only; stays nil when streaming
+	stream bool   // body streams through unhashed (--unsigned-payload)
+}
+
+// buildProxyRequest builds the signable outbound request from the inbound
+// one, consuming req.Body.
+func (p *proxyClient) buildProxyRequest(req *http.Request) (*builtRequest, error) {
+	ctx := req.Context()
+
 	proxyURL := *req.URL
 	proxyURL.Host = req.Host
 	if p.hostOverride != "" {
@@ -231,14 +277,6 @@ func (p *proxyClient) Do(req *http.Request) (*http.Response, error) {
 		proxyReq.Host = p.signingHostOverride
 	}
 
-	svc := p.serviceOverride
-	if svc == nil {
-		svc = p.determineSigningService(req.Host)
-	}
-	if svc == nil {
-		return nil, fmt.Errorf("unable to determine service from host: %q (set --name and --region)", p.signingServiceHost(req.Host))
-	}
-
 	// Copy the caller's headers onto the proxy request, then drop hop-by-hop
 	// headers. This happens BEFORE signing so the caller's headers (notably
 	// x-amz-*, which AWS requires to be part of the signature) are included in
@@ -275,35 +313,17 @@ func (p *proxyClient) Do(req *http.Request) (*http.Response, error) {
 
 	copyHeaderWithoutOverwrite(proxyReq.Header, p.customHeaders)
 
-	payloadHash := unsignedPayloadHash
-	if !p.unsignedPayload {
-		sum := sha256.Sum256(body)
-		payloadHash = hex.EncodeToString(sum[:])
-	}
-	if err := p.sign(ctx, proxyReq, payloadHash, svc); err != nil {
-		return nil, err
-	}
+	return &builtRequest{req: proxyReq, body: body, stream: stream}, nil
+}
 
-	p.debugDumpRequest(ctx, "proxying request", proxyReq, !stream)
-
-	resp, err := p.client.Do(proxyReq)
-	if err != nil {
-		return nil, err
+func (p *proxyClient) resolveSigningService(requestHost string) (*awsService, error) {
+	if p.serviceOverride != nil {
+		return p.serviceOverride, nil
 	}
-
-	if p.logFailedRequest && resp.StatusCode >= 400 {
-		// Log a bounded prefix of the error body without buffering the whole
-		// response, then splice it back so the caller still sees the full body.
-		const maxLogBody = 64 << 10
-		prefix, _ := io.ReadAll(io.LimitReader(resp.Body, maxLogBody))
-		p.logger.Error("error proxying request",
-			"request", fmt.Sprintf("%s %s", proxyReq.Method, proxyReq.URL),
-			"status_code", resp.StatusCode,
-			"message", string(prefix))
-		resp.Body = spliceBody(prefix, resp.Body)
+	if svc := p.determineSigningService(requestHost); svc != nil {
+		return svc, nil
 	}
-
-	return resp, nil
+	return nil, fmt.Errorf("unable to determine service from host: %q (set --name and --region)", p.signingServiceHost(requestHost))
 }
 
 func (p *proxyClient) signingServiceHost(requestHost string) string {
@@ -322,7 +342,16 @@ func (p *proxyClient) determineSigningService(requestHost string) *awsService {
 	return determineAWSServiceFromHost(requestHost)
 }
 
-func (p *proxyClient) sign(ctx context.Context, req *http.Request, payloadHash string, svc *awsService) error {
+func (p *proxyClient) sign(ctx context.Context, req *http.Request, body []byte, svc *awsService) error {
+	// body is nil on the streaming path, but there unsignedPayload is always
+	// true so it is never hashed. On the buffered path sha256.Sum256(nil)
+	// equals the empty-body hash, so bodyless requests still sign correctly.
+	payloadHash := unsignedPayloadHash
+	if !p.unsignedPayload {
+		sum := sha256.Sum256(body)
+		payloadHash = hex.EncodeToString(sum[:])
+	}
+
 	creds, err := p.credentials.Retrieve(ctx)
 	if err != nil {
 		return err
