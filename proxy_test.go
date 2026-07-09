@@ -101,6 +101,11 @@ func TestDetermineAWSServiceFromHost(t *testing.T) {
 		{host: "iam.us-gov.amazonaws.com", wantName: "iam", wantRegion: "us-gov-west-1"},
 		// ...and match the exact host only: junk prefixes must not sign.
 		{host: "foo.iam.amazonaws.com", wantNil: true},
+		// A bare vpce suffix with no service labels left is not an endpoint.
+		{host: "vpce.amazonaws.com", wantNil: true},
+		// A region with no service label before it has nothing to sign as.
+		{host: "us-east-1.amazonaws.com", wantNil: true},
+		{host: "foo.us-west-2.bar.amazonaws.com", wantNil: true},
 		// Garbage labels must not become signing names.
 		{host: "my_svc!.us-east-1.amazonaws.com", wantNil: true},
 		{host: ".us-east-1.amazonaws.com", wantNil: true},
