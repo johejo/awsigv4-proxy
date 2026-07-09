@@ -446,11 +446,14 @@ func signedHeadersFromAuth(t *testing.T, auth string) []string {
 	return nil
 }
 
+// fixedSignTime is the frozen clock behind the golden Authorization values
+// (credential scope 20260702).
+var fixedSignTime = time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC)
+
 func TestDeterministicSignature(t *testing.T) {
-	fixed := time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC)
 	stub := &stubClient{}
 	p := staticProxy(stub)
-	p.now = func() time.Time { return fixed }
+	p.now = func() time.Time { return fixedSignTime }
 
 	const bodyStr = "Action=GetCallerIdentity&Version=2011-06-15"
 	req := httptest.NewRequest(http.MethodPost, "http://sts.us-east-1.amazonaws.com/", strings.NewReader(bodyStr))
@@ -469,6 +472,69 @@ func TestDeterministicSignature(t *testing.T) {
 	}
 	if stub.got.URL.Scheme != "https" {
 		t.Errorf("scheme = %q, want https (default upstream scheme)", stub.got.URL.Scheme)
+	}
+}
+
+// TestS3PathEscaping covers the wire-path rewrite in sign(); verified against
+// live S3, pinned by the golden signature.
+func TestS3PathEscaping(t *testing.T) {
+	tests := []struct {
+		name     string
+		url      string
+		wantPath string
+		// golden value as in TestDeterministicSignature; empty skips the check
+		wantAuth string
+	}{
+		{
+			name:     "sub-delims are single-encoded",
+			url:      "http://mybucket.s3.us-west-2.amazonaws.com/orgId=abc/time=01:20/a+b*(c),$@.json",
+			wantPath: "/orgId%3Dabc/time%3D01%3A20/a%2Bb%2A%28c%29%2C%24%40.json",
+			wantAuth: "AWS4-HMAC-SHA256 Credential=AKID/20260702/us-west-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=32d8f05f86a7cea3c8e37f7c896c914f692b7cde1cf8545061f90020b61a03de",
+		},
+		{
+			name:     "pre-encoded path is preserved",
+			url:      "http://mybucket.s3.us-west-2.amazonaws.com/a%3Db.json",
+			wantPath: "/a%3Db.json",
+		},
+		{
+			name:     "encoded slash is normalized to the same key's raw form",
+			url:      "http://mybucket.s3.us-west-2.amazonaws.com/a%2Fb.json",
+			wantPath: "/a/b.json",
+		},
+		{
+			name:     "unreserved characters stay raw",
+			url:      "http://mybucket.s3.us-west-2.amazonaws.com/a-b_c.d~e.json",
+			wantPath: "/a-b_c.d~e.json",
+		},
+		{
+			name:     "s3-outposts is rewritten like S3",
+			url:      "http://myap-123456789012.op-01234567890123456.s3-outposts.us-west-2.amazonaws.com/orgId=abc/x.json",
+			wantPath: "/orgId%3Dabc/x.json",
+		},
+		{
+			name:     "non-S3 service keeps its wire path untouched",
+			url:      "http://lambda.us-west-2.amazonaws.com/2015-03-31/functions/arn:aws:lambda:us-west-2:123:function:f",
+			wantPath: "/2015-03-31/functions/arn:aws:lambda:us-west-2:123:function:f",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stub := &stubClient{}
+			p := staticProxy(stub)
+			p.now = func() time.Time { return fixedSignTime }
+			req := httptest.NewRequest(http.MethodGet, tt.url, nil)
+			if _, err := p.Do(req); err != nil {
+				t.Fatalf("Do: %v", err)
+			}
+			if got := stub.got.URL.EscapedPath(); got != tt.wantPath {
+				t.Errorf("wire path = %q, want %q", got, tt.wantPath)
+			}
+			if tt.wantAuth != "" {
+				if auth := stub.got.Header.Get("Authorization"); auth != tt.wantAuth {
+					t.Errorf("Authorization = %q, want %q", auth, tt.wantAuth)
+				}
+			}
+		})
 	}
 }
 

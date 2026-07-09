@@ -22,6 +22,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
+	"github.com/aws/smithy-go/encoding/httpbinding"
 )
 
 // unsignedPayloadHash is the sentinel payload hash used to skip payload signing.
@@ -332,6 +333,14 @@ func (p *proxyClient) sign(ctx context.Context, req *http.Request, payloadHash s
 	// is harmless for other services.
 	req.Header.Set("X-Amz-Content-Sha256", payloadHash)
 
+	// The signer signs EscapedPath verbatim, but S3 canonicalizes the received
+	// path by single-encoding every byte outside the unreserved set, so a key
+	// with raw '=' or ':' would get SignatureDoesNotMatch. Rewrite the path to
+	// that encoding, like the original aws-sigv4-proxy (rest.EscapePath).
+	if svc.disableURIPathEscaping() {
+		req.URL.RawPath = httpbinding.EscapePath(req.URL.Path, false)
+	}
+
 	signTime := time.Now()
 	if p.now != nil {
 		signTime = p.now()
@@ -457,10 +466,14 @@ type awsService struct {
 }
 
 // disableURIPathEscaping reports whether SigV4's additional URI path escaping
-// must be disabled for this service; S3 (and S3 Object Lambda) reject
-// double-escaped paths.
+// must be disabled for this service; the S3 family (S3, S3 Object Lambda, S3
+// on Outposts) rejects double-escaped paths.
 func (s *awsService) disableURIPathEscaping() bool {
-	return s.signingName == "s3" || s.signingName == "s3-object-lambda"
+	switch s.signingName {
+	case "s3", "s3-object-lambda", "s3-outposts":
+		return true
+	}
+	return false
 }
 
 // isRegionAny reports whether s matches any partition's region pattern; used
