@@ -294,6 +294,7 @@ func staticProxy(client httpClient) *proxyClient {
 		client:      client,
 		credentials: credentials.NewStaticCredentialsProvider("AKID", "SECRET", ""),
 		logger:      discardLogger(),
+		now:         time.Now,
 	}
 }
 

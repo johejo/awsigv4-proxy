@@ -213,6 +213,7 @@ func run(ctx context.Context, o *options, logger *slog.Logger) error {
 			schemeOverride:      o.upstreamScheme,
 			unsignedPayload:     o.unsignedPayload,
 			maxBodySize:         o.maxRequestBodySize,
+			now:                 time.Now,
 		},
 	}
 

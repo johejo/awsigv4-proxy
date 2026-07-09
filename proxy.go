@@ -136,8 +136,8 @@ type proxyClient struct {
 	unsignedPayload     bool
 	maxBodySize         int64
 
-	// now returns the signing time; nil means time.Now. Injected by tests to
-	// make signatures deterministic.
+	// now returns the signing time; time.Now in production, overridden by
+	// tests to make signatures deterministic.
 	now func() time.Time
 }
 
@@ -370,11 +370,7 @@ func (p *proxyClient) sign(ctx context.Context, req *http.Request, body []byte, 
 		req.URL.RawPath = httpbinding.EscapePath(req.URL.Path, false)
 	}
 
-	signTime := time.Now()
-	if p.now != nil {
-		signTime = p.now()
-	}
-	err = p.signer.SignHTTP(ctx, creds, req, payloadHash, svc.signingName, svc.signingRegion, signTime, func(so *v4.SignerOptions) {
+	err = p.signer.SignHTTP(ctx, creds, req, payloadHash, svc.signingName, svc.signingRegion, p.now(), func(so *v4.SignerOptions) {
 		so.DisableURIPathEscaping = svc.disableURIPathEscaping()
 	})
 	if err == nil {
