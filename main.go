@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
@@ -34,6 +35,18 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/aws/smithy-go/logging"
 )
+
+var version string
+
+func versionString() string {
+	if version != "" {
+		return version
+	}
+	if bi, ok := debug.ReadBuildInfo(); ok && bi.Main.Version != "" {
+		return bi.Main.Version
+	}
+	return "(unknown)"
+}
 
 // stringSlice is a flag.Value that accumulates repeated flag occurrences.
 type stringSlice []string
@@ -66,6 +79,7 @@ type options struct {
 	upstreamScheme      string
 	unsignedPayload     bool
 	maxRequestBodySize  int64
+	version             bool
 }
 
 const defaultMaxRequestBodySize = 256 << 20 // 256 MiB
@@ -94,6 +108,7 @@ func parseFlags(fs *flag.FlagSet, args []string) (*options, error) {
 	fs.StringVar(&o.upstreamScheme, "upstream-url-scheme", "", "Protocol to proxy with")
 	fs.BoolVar(&o.unsignedPayload, "unsigned-payload", false, "Prevent signing of the payload")
 	fs.Int64Var(&o.maxRequestBodySize, "max-request-body-size", defaultMaxRequestBodySize, "Maximum inbound request body size in bytes; larger requests are rejected with 413 (default 256MiB; 0 means no limit)")
+	fs.BoolVar(&o.version, "version", false, "Print version and exit")
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
@@ -117,6 +132,10 @@ func main() {
 			os.Exit(0)
 		}
 		os.Exit(2)
+	}
+	if o.version {
+		fmt.Println(versionString())
+		os.Exit(0)
 	}
 
 	level := slog.LevelInfo

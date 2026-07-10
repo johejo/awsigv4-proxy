@@ -131,6 +131,22 @@ func TestRoleSessionName(t *testing.T) {
 	}
 }
 
+func TestVersionString(t *testing.T) {
+	old := version
+	t.Cleanup(func() { version = old })
+
+	version = "v9.9.9"
+	if got := versionString(); got != "v9.9.9" {
+		t.Errorf("versionString() = %q, want v9.9.9", got)
+	}
+
+	// The fallback value varies by build, so only assert it is non-empty.
+	version = ""
+	if got := versionString(); got == "" {
+		t.Error("versionString() = \"\", want non-empty fallback")
+	}
+}
+
 func parseFlagsForTest(args ...string) (*options, error) {
 	fs := flag.NewFlagSet("test", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -151,5 +167,13 @@ func TestParseFlagsRejectsLeftoverArgs(t *testing.T) {
 	}
 	if o.maxRequestBodySize != defaultMaxRequestBodySize {
 		t.Errorf("maxRequestBodySize = %d, want default %d", o.maxRequestBodySize, defaultMaxRequestBodySize)
+	}
+
+	if o.version {
+		t.Error("version = true, want false by default")
+	}
+	o, err = parseFlagsForTest("--version")
+	if err != nil || !o.version {
+		t.Errorf("parseFlags(--version) = %+v, %v; want version=true", o, err)
 	}
 }
