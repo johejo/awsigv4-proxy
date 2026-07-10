@@ -31,7 +31,7 @@ import (
 )
 
 // defaultRef is the pinned botocore release the generated file is built from.
-const defaultRef = "1.43.42"
+const defaultRef = "1.43.45"
 
 func main() {
 	log.SetFlags(0)
